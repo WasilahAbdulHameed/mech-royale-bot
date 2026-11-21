@@ -1,26 +1,28 @@
-"""Movement & survival (owner: Wasilah).
+"""Movement & survival v2 (owner: Wasilah).
 
 decide_move(obs, memory) -> dict with ONLY: move, boost, jump, take
 
 Priority each tick:
   1. Get into / stay inside the safe zone
-  2. Low HP or outnumbered -> run away (but not out of the zone)
+  2. Low HP or outnumbered -> run to a spot BEHIND a building (away from enemies)
   3. One enemy -> strafe side to side so we're harder to hit
   4. Safe -> grab cubes, weapons, supply drops
-  5. Otherwise -> sneak slowly (silent) near the next zone's center
-Plus: avoid NPC drones, and un-stick ourselves if we walk into a wall.
+  5. Otherwise -> park with our back to a wall inside the next circle, standing still (silent)
+Plus: steer around buildings, avoid NPC drones, and un-stick ourselves on walls.
+v2 = uses the map (mapdata.py). If the map fails to load, it behaves like v1.
 """
 import math
 import random
 
 # ---- tuning knobs (change these to experiment) ----
-LOW_HP = 0.45          # below this fraction of max HP, we retreat
+LOW_HP = 0.5           # below this fraction of max HP, we retreat
 DANGER_RANGE = 90.0    # enemies closer than this count as a threat
 LOOT_SAFE_RANGE = 120.0  # only loot if no enemy is closer than this
 CUBE_RANGE = 50.0      # walk to visible cubes within this distance
 PICKUP_RANGE = 60.0    # walk to weapon pickups within this distance
 NPC_AVOID = 55.0       # keep this far from NPC drones
 ZONE_EDGE_BUFFER = 25.0  # start moving inward when this close to the zone edge
+HOLD_FRACTION = 0.5    # park within this fraction of the next circle's radius
 SNEAK = 0.4            # walk speed fraction when idle (below 5 m/s = no footstep sound)
 WEAPON_PREF = {"laser": 3, "lightning": 2, "mortar": 1}  # which loot we want most
 
@@ -47,6 +49,9 @@ def decide_move(obs, memory):
     hp_frac = me["hp"] / max(1.0, me["max_hp"])
     energy = me["energy"]
     reach = memory.get("reach", 4.0)
+    gmap = memory.get("map")
+    if gmap is not None and not gmap.ok:
+        gmap = None
     out = {}
 
     enemies = [m for m in obs["mechs"] if m["kind"] == "mech"]
@@ -71,20 +76,26 @@ def decide_move(obs, memory):
     far_from_next = _dist2d((x, y), (ncx, ncy)) > next_r * 0.6
 
     dx, dy, speed, boost, mode = 0.0, 0.0, SNEAK, False, "hold"
+    face = None  # direction to look when parked
+    goal = None  # a point we're walking to (gets steered around buildings)
 
     # ---- 1. Zone ----
     if not me["in_zone"] or margin < ZONE_EDGE_BUFFER:
-        dx, dy = to_next
+        goal = (ncx, ncy)
         speed, mode = 1.0, "zone"
         boost = (not me["in_zone"] or margin < 10) and energy > 10
 
-    # ---- 2. Retreat ----
+    # ---- 2. Retreat behind a building ----
     elif threats and (hp_frac < LOW_HP or len(threats) >= 2):
-        ax = sum(x - m["pos"][0] for m in threats)
-        ay = sum(y - m["pos"][1] for m in threats)
-        ax, ay = _unit(ax, ay)
-        pull = 1.5 if far_from_next else 0.4  # don't run out of the zone
-        dx, dy = _unit(ax + to_next[0] * pull, ay + to_next[1] * pull)
+        tx = sum(m["pos"][0] for m in threats) / len(threats)
+        ty = sum(m["pos"][1] for m in threats) / len(threats)
+        spot = _retreat_spot(gmap, memory, t, x, y, (tx, ty), zone)
+        if spot is not None:
+            goal = spot[:2]
+        else:
+            ax, ay = _unit(x - tx, y - ty)
+            pull = 1.5 if far_from_next else 0.4  # don't run out of the zone
+            dx, dy = _unit(ax + to_next[0] * pull, ay + to_next[1] * pull)
         speed, mode = 1.0, "retreat"
         boost = energy > 25
 
@@ -99,39 +110,40 @@ def decide_move(obs, memory):
             bx, by, d = math.cos(b), math.sin(b), 60.0
         side = 1 if int(t / 1.5) % 2 == 0 else -1  # switch strafe direction every 1.5 s
         sx, sy = -by * side, bx * side
-        # keep a medium distance: back off if too close, close in a bit if far
-        k = -0.5 if d < 40 else (0.3 if d > 120 else 0.0)
-        dx, dy = _unit(sx + bx * k + to_next[0] * (0.5 if far_from_next else 0), sy + by * k + to_next[1] * (0.5 if far_from_next else 0))
+        k = -0.5 if d < 40 else (0.3 if d > 120 else 0.0)  # keep medium distance
+        z = 0.5 if far_from_next else 0.0
+        dx, dy = _unit(sx + bx * k + to_next[0] * z, sy + by * k + to_next[1] * z)
         speed, mode = 1.0, "strafe"
 
-    # ---- 4. Loot ----
+    # ---- 4. Loot / 5. Hold ----
     else:
         target = None
         if hp_frac > 0.5 and nearest_enemy > LOOT_SAFE_RANGE:
-            target, mode, out_take = _pick_loot(obs, me, x, y, reach)
-            if out_take is not None:
-                out["take"] = out_take
+            target, mode, take = _pick_loot(obs, me, x, y, reach)
+            if take is not None:
+                out["take"] = take
         if target is not None:
-            dx, dy = _unit(target[0] - x, target[1] - y)
-            speed = 1.0
-            if _dist2d(target, (x, y)) < 2.0:
-                speed = 0.0  # standing on it (supply drop ring / pickup)
+            goal, speed = target[:2], 1.0
         elif far_from_next:
-            dx, dy = to_next
-            speed, mode = 1.0, "travel"
+            goal, speed, mode = (ncx, ncy), 1.0, "travel"
         else:
-            # ---- 5. Hold: sneak around a spot inside the next circle ----
-            hp_pt = memory.get("hold_pt")
-            if hp_pt is None or _dist2d(hp_pt, (x, y)) < 5 or _dist2d(hp_pt, (ncx, ncy)) > next_r * 0.5:
-                ang = random.uniform(-math.pi, math.pi)
-                rad = random.uniform(0, next_r * 0.35)
-                hp_pt = (ncx + rad * math.cos(ang), ncy + rad * math.sin(ang))
-                memory["hold_pt"] = hp_pt
-            dx, dy = _unit(hp_pt[0] - x, hp_pt[1] - y)
-            speed, mode = SNEAK, "hold"
+            spot = _hold_spot(gmap, memory, x, y, ncx, ncy, next_r)
+            goal = spot[:2]
+            face = spot[2]
+            mode = "hold"
+            d = _dist2d(goal, (x, y))
+            speed = SNEAK if d > 30 else (0.3 if d > 2.5 else 0.0)
+            if d > 30 and nearest_enemy > 200:
+                speed = 0.8  # nobody around: get there faster
+
+    # Turn a goal point into a direction, steering around buildings
+    if goal is not None:
+        dx, dy = _unit(goal[0] - x, goal[1] - y)
+        if gmap is not None and _dist2d(goal, (x, y)) > 6:
+            dx, dy = _steer(gmap, x, y, dx, dy)
 
     # ---- NPC avoidance (they shoot anyone within ~45 m of their home) ----
-    if mode not in ("zone",):
+    if mode != "zone":
         for n in npcs:
             d = _dist2d(n["pos"], (x, y))
             if d < NPC_AVOID:
@@ -153,9 +165,13 @@ def decide_move(obs, memory):
     elif speed > 0.3 and len(hist) == 10 and _dist2d(hist[0], hist[-1]) < 1.5:
         memory["unstick_until"] = t + 1.5
         memory["unstick_ang"] = random.choice([math.pi / 2, -math.pi / 2, math.pi * 0.75])
+        memory.pop("hold_pt", None)  # maybe that spot is unreachable: pick another
         hist.clear()
 
-    if dx or dy:
+    # What combat should face when it has no target
+    if speed == 0.0 and face is not None:
+        memory["move_yaw"] = face  # back to the wall, looking out
+    elif dx or dy:
         memory["move_yaw"] = math.atan2(dy, dx)
     memory["mode"] = mode
 
@@ -163,12 +179,77 @@ def decide_move(obs, memory):
     return out
 
 
+# ---------------- helpers ----------------
+
+def _steer(gmap, x, y, dx, dy, probe=15.0):
+    """If a building is straight ahead, try turning left/right until the way is clear."""
+    if not gmap.blocked((x, y), (x + dx * probe, y + dy * probe), step=5.0):
+        return dx, dy
+    for deg in (30, -30, 60, -60, 90, -90, 120, -120):
+        rx, ry = _rotate(dx, dy, math.radians(deg))
+        if not gmap.blocked((x, y), (x + rx * probe, y + ry * probe), step=5.0):
+            return rx, ry
+    return dx, dy
+
+
+def _hold_spot(gmap, memory, x, y, ncx, ncy, next_r):
+    """A parking spot inside the next circle. With the map: next to a wall. Cached until invalid."""
+    spot = memory.get("hold_pt")
+    limit = next_r * HOLD_FRACTION
+    if spot is not None and _dist2d(spot, (ncx, ncy)) <= limit:
+        return spot
+    spot = None
+    if gmap is not None:
+        best = 1e9
+        # search near us first, then near the zone center
+        for cx, cy in ((x, y), (ncx, ncy)):
+            for d, p in gmap.cover_near(cx, cy, 150.0)[:400]:
+                dc = _dist2d(p, (ncx, ncy))
+                if dc > limit:
+                    continue
+                score = _dist2d(p, (x, y)) + 0.3 * dc
+                if score < best:
+                    best, spot = score, p
+            if spot is not None:
+                break
+    if spot is None:  # no map / no wall nearby: random spot near the center
+        ang = random.uniform(-math.pi, math.pi)
+        rad = random.uniform(0, next_r * 0.35)
+        spot = (ncx + rad * math.cos(ang), ncy + rad * math.sin(ang), math.atan2(ncy - y, ncx - x))
+    memory["hold_pt"] = spot
+    return spot
+
+
+def _retreat_spot(gmap, memory, t, x, y, threat, zone):
+    """A cover spot within 80 m that has a building between it and the threat. Recomputed once a second."""
+    if gmap is None:
+        return None
+    cached = memory.get("retreat")
+    if cached and t - cached[0] < 1.0:
+        return cached[1]
+    ccx, ccy = zone["center"]
+    best = None
+    checked = 0
+    for d, p in gmap.cover_near(x, y, 80.0):
+        if _dist2d(p, (ccx, ccy)) > zone["radius"] - 15:
+            continue  # don't hide outside the zone
+        if _dist2d(p, threat) < _dist2d((x, y), threat) - 10:
+            continue  # don't run toward them
+        checked += 1
+        if gmap.blocked(threat, p, step=5.0):
+            best = p
+            break  # list is sorted by distance: first hit is the closest
+        if checked >= 15:
+            break
+    memory["retreat"] = (t, best)
+    return best
+
+
 def _pick_loot(obs, me, x, y, reach):
     """Returns (target_point or None, mode, take_id or None)."""
     held = {w["kind"] for w in me["weapons"] if w}
     slot1_empty = me["weapons"][1] is None if len(me["weapons"]) > 1 else False
 
-    # Weapons: only if we have a free slot
     if slot1_empty:
         best, best_score = None, -1
         for p in obs.get("pickups", []):
@@ -185,12 +266,10 @@ def _pick_loot(obs, me, x, y, reach):
             take = best["id"] if d < reach and abs(best["pos"][2] - me["pos"][2]) < 4 else None
             return best["pos"], "loot-weapon", take
 
-    # Cubes: +4% HP and damage each
     cubes = sorted(obs.get("cubes", []), key=lambda c: _dist2d(c["pos"], (x, y)))
     if cubes and _dist2d(cubes[0]["pos"], (x, y)) < CUBE_RANGE and abs(cubes[0]["pos"][2] - me["pos"][2]) < 15:
         return cubes[0]["pos"], "loot-cube", None
 
-    # Supply drop: full HP + 3 cubes, only if close and nobody else is on it
     for dr in obs.get("drops", []):
         d = _dist2d(dr["pos"], (x, y))
         if d < 100 and dr.get("lands_in", 99) < 8 and dr.get("holder") in (None, me["id"]):

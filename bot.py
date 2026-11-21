@@ -1,4 +1,4 @@
-"""Main bot: joins movement (where to go) and combat (what to shoot) into one action.
+"""Main bot (v2): joins movement (where to go) and combat (what to shoot) into one action.
 
 Owner: Wasilah (integration). movement.py = Wasilah, combat.py = teammate.
 """
@@ -7,6 +7,7 @@ import random
 
 import mechfight as mf
 import combat
+import mapdata
 import movement
 
 # Upgrade preference: survival first. Words are matched against the upgrade's id/name/desc.
@@ -39,6 +40,10 @@ class Bot:
             "slot": hello.get("slot"),
             "reach": cfg.get("loot", {}).get("pickup_radius", 4.0),
         }
+        # Load the map once (buildings -> cover spots). If it fails, movement runs without it.
+        self.memory["map"] = mapdata.MapData(hello.get("map", {}).get("dir", "/arena"))
+        mf.log(f"map loaded: {self.memory['map'].ok}, buildings={len(self.memory['map'].prisms)}, "
+               f"cover spots={len(self.memory['map'].cover)}")
 
     def act(self, obs):
         mem = self.memory
