@@ -182,15 +182,11 @@ def decide_combat(obs, memory):
     out["aim"] = [yaw, pitch]
     aligned = (_angdiff(current_yaw, yaw) < tolerance
                and abs(current_pitch - pitch) < tolerance * 1.5)
-    # Gun bullets need a lead angle even when a hitscan special weapon steers the torso.
-    gun_yaw, gun_pitch = _aim_at(muzzle, predicted)
-    gun_aligned = (_angdiff(current_yaw, gun_yaw) < tolerance
-                   and abs(current_pitch - gun_pitch) < tolerance * 1.5)
 
     if gun and gun.get("kind") == "gun":
         if gun.get("ammo", 0) == 0 and gun.get("reload", 0) <= 0:
             out["reload"] = True
-        if gun_aligned and not blocked and distance < gun.get("stats", {}).get("range", 230):
+        if aligned and not blocked and distance < gun.get("stats", {}).get("range", 230):
             out["fire"][0] = True
 
     if special and plan == "lightning":
