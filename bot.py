@@ -1,4 +1,4 @@
-      """Main bot (v8, farm, fight, endgame): joins movement (where to go) and combat (what to shoot) into one action.
+"""Main bot (v8, farm, fight, endgame): joins movement (where to go) and combat (what to shoot) into one action.
 
 Owner: Wasilah (integration). movement.py = Wasilah, combat.py = teammate.
 """
