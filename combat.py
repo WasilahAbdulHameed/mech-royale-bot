@@ -1,4 +1,6 @@
-"""Survival-first Mech Royale combat. Only returns aim, fire, reload.
+"""Mech Royale v6 combat: survival, farm targets, and cover-aware firing.
+
+Only returns aim, fire, reload.
 
 Compatible with bot.py merging combat actions into movement actions.
 Movement/retreat must be handled by movement.py; this module does not move.
@@ -68,40 +70,52 @@ def decide_combat(obs, memory):
         if now - when > 6.0:
             del attackers[enemy_id]
 
-    # Prefer fighting back, or finishing a nearby weakened enemy.
+    # 1. Enemy mechs always have priority over farming targets.
     target = None
     kind = None
     best_score = float("inf")
     for enemy in obs.get("mechs", []):
+        if enemy.get("kind") != "mech":
+            continue
         distance = _d3(pos, enemy["pos"])
         is_attacker = str(enemy["id"]) in attackers
-        if enemy.get("kind") == "npc":
-            if not is_attacker or distance > 65:
+        hp_ratio = enemy.get("hp", 1400) / max(1, enemy.get("max_hp", 1400))
+        can_finish = hp_ratio < 0.18 and distance < 65
+        if is_attacker:
+            if distance > THREAT_RANGE:
                 continue
-            score = distance + 30
-        else:
-            hp_ratio = enemy.get("hp", 1400) / max(1, enemy.get("max_hp", 1400))
-            # At low health, preserve regeneration by avoiding new fights.
-            can_finish = hp_ratio < 0.18 and distance < 65
-            if is_attacker:
-                if distance > THREAT_RANGE:
-                    continue
-            elif (health_ratio < 0.45 and not can_finish) or distance > ENGAGE_RANGE:
-                continue
-            score = distance + 50 * hp_ratio - (85 if is_attacker else 0)
-            if can_finish:
-                score -= 30
+        elif (health_ratio < 0.45 and not can_finish) or distance > ENGAGE_RANGE:
+            continue
+        score = distance + 50 * hp_ratio - (85 if is_attacker else 0)
+        if can_finish:
+            score -= 30
         if score < best_score:
-            target, kind, best_score = enemy, enemy.get("kind"), score
+            target, kind, best_score = enemy, "mech", score
 
-    # Crates grant useful cubes/weapon loot, but avoid shooting them during danger.
-    if target is None and health_ratio > 0.60 and not attackers:
-        nearby = [c for c in obs.get("crates", [])
-                  if _d3(pos, c["pos"]) < CRATE_RANGE]
-        if nearby:
-            crate = min(nearby, key=lambda c: _d3(pos, c["pos"]))
-            target = {"pos": crate["pos"], "vel": [0, 0, 0]}
-            kind = "crate"
+    # 2. Farm the NPC or crate selected by movement.py, if still visible.
+    # IDs can be integers or strings; normalize to avoid a mismatch.
+    if target is None:
+        farm_id = memory.get("farm_target")
+        if farm_id is not None:
+            for npc in obs.get("mechs", []):
+                if npc.get("kind") == "npc" and str(npc.get("id")) == str(farm_id):
+                    target, kind = npc, "npc"
+                    break
+            if target is None:
+                for crate in obs.get("crates", []):
+                    if str(crate.get("id")) == str(farm_id):
+                        target, kind = crate, "crate"
+                        break
+
+    # 3. If not farming, defend against an NPC that recently damaged us.
+    if target is None:
+        nearby_attackers = [npc for npc in obs.get("mechs", [])
+                            if npc.get("kind") == "npc"
+                            and str(npc.get("id")) in attackers
+                            and _d3(pos, npc["pos"]) <= 65]
+        if nearby_attackers:
+            target = min(nearby_attackers, key=lambda npc: _d3(pos, npc["pos"]))
+            kind = "npc"
 
     if target is None:
         # Taking damage from behind is especially costly; protect front armor.
@@ -121,15 +135,27 @@ def decide_combat(obs, memory):
     current_yaw, current_pitch = me["aim"]
     tolerance = max(0.025, math.atan2(2.0, max(distance, 1.0)))
 
+    # Buildings block direct gun, laser and lightning shots. The map's blocked()
+    # method accepts horizontal (x, y) points, as used by movement.py.
+    # Mortars are indirect and can sometimes clear buildings, so do not
+    # suppress a mortar just because the ground-level line is blocked.
+    gmap = memory.get("map")
+    blocked = False
+    if gmap is not None and getattr(gmap, "ok", False):
+        try:
+            blocked = bool(gmap.blocked(pos[:2], target["pos"][:2], step=5.0))
+        except (AttributeError, TypeError, ValueError):
+            blocked = False
+
     # Special weapon, if useful. Do not start a charge that slows our escape
     # when health is low; existing charges are released below.
     plan = "gun"
     if special:
         name = special.get("kind")
         s = special.get("stats", {})
-        if name == "lightning" and distance < s.get("range", 45) - 3:
+        if name == "lightning" and not blocked and distance < s.get("range", 45) - 3:
             plan = "lightning"
-        elif name == "laser" and distance < s.get("range", 280):
+        elif name == "laser" and not blocked and distance < s.get("range", 280):
             if health_ratio > 0.5 or special.get("charge", 0) > 0:
                 plan = "laser"
         elif name == "mortar" and 32 < distance < 190 and special.get("cooldown", 0) <= 0:
@@ -160,7 +186,7 @@ def decide_combat(obs, memory):
     if gun and gun.get("kind") == "gun":
         if gun.get("ammo", 0) == 0 and gun.get("reload", 0) <= 0:
             out["reload"] = True
-        if aligned and distance < gun.get("stats", {}).get("range", 230):
+        if aligned and not blocked and distance < gun.get("stats", {}).get("range", 230):
             out["fire"][0] = True
 
     if special and plan == "lightning":
@@ -179,3 +205,4 @@ def decide_combat(obs, memory):
             out["fire"][1] = True
 
     return out
+
