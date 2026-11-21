@@ -8,7 +8,7 @@ decide_combat(obs, memory) -> dict with ONLY: aim, fire, reload
 """
 import math
 
-ENGAGE_RANGE = 130.0     # shoot enemies closer than this (further = stay quiet, just watch)
+ENGAGE_RANGE = 70.0      # shoot enemies closer than this (further = stay quiet, just watch). v2: was 130
 CRATE_RANGE = 40.0       # shoot crates this close when nothing else is around
 
 
@@ -102,7 +102,6 @@ def decide_combat(obs, memory):
         # top up the gun while nothing is happening
         if w0 and w0["kind"] == "gun" and w0.get("ammo", 99) < w0["stats"].get("mag", 12) * 0.5 and w0.get("reload", 0) == 0:
             out["reload"] = True
-        # release a laser charge if one is held with nothing to shoot
         return out
 
     # ---- aim + fire ----
