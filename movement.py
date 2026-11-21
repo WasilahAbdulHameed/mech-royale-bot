@@ -1,4 +1,12 @@
-"""Movement v6 (owner: Wasilah): FARM, then FIGHT.
+"""Movement v7 (owner: Wasilah): FARM, then FIGHT, and don't get caught out.
+
+v7 changes (survival):
+  1. Avoids getting surrounded: 2+ enemies on different sides -> back off to cover that blocks most of them.
+  2. Retreats when a fight turns dangerous (outnumbered, losing the HP race, hit from behind),
+     not only at very low HP.
+  3. Rotates to the next safe circle EARLY (before the shrink starts, with time to spare),
+     and stops farming things outside that circle when a shrink is coming.
+  4. Keeps collecting cubes and weapons when it's safe, including while healing.
 
 decide_move(obs, memory) -> dict with ONLY: move, boost, jump, take, drop
 It also sets memory["farm_target"] (an NPC drone or crate id) for combat.py to shoot.
@@ -22,6 +30,9 @@ import random
 RETREAT_HP = 0.35      # retreat below this HP fraction...
 RECOVER_TO = 0.80      # ...and recover until healed to this
 DANGER_RANGE = 90.0
+SURROUND_RANGE = 120.0  # enemies this close count toward "being surrounded"
+SURROUND_SPREAD = math.radians(100)  # enemies spread over more than this angle = surrounded
+ROTATE_BUFFER_S = 15.0  # arrive inside the next circle this many seconds before the shrink
 FIGHT_RANGE = 110.0    # only switch to fight mode for enemies this close (or ones shooting us / coming at us)
 FIGHT_MIN, FIGHT_MAX = 30.0, 80.0   # preferred distance with just the gun
 CLOSE_MIN, CLOSE_MAX = 12.0, 32.0   # preferred distance with lightning (45 m range)
@@ -97,6 +108,37 @@ def decide_move(obs, memory):
     margin = zone["radius"] - _dist2d((x, y), (ccx, ccy))
     has_lightning = any(w and w["kind"] == "lightning" for w in me["weapons"])
 
+    # ---- how dangerous is the current fight? ----
+    for ev in obs.get("events", []):
+        if ev.get("type") == "damaged" and ev.get("rear") and ev.get("by") is not None:
+            memory.setdefault("rear_hits", []).append(t)
+    rear_hits = [h for h in memory.get("rear_hits", []) if t - h < 3.0]
+    memory["rear_hits"] = rear_hits
+    near = [(d, m) for d, m in enemy_d if d < SURROUND_RANGE]
+    surrounded = False
+    if len(near) >= 2:
+        angs = sorted(math.atan2(m["pos"][1] - y, m["pos"][0] - x) for d, m in near)
+        gaps = [angs[i + 1] - angs[i] for i in range(len(angs) - 1)] + [angs[0] + 2 * math.pi - angs[-1]]
+        surrounded = (2 * math.pi - max(gaps)) > SURROUND_SPREAD  # how wide an arc they cover
+    strongest = max((m.get("hp", 1400) / max(1.0, m.get("max_hp", 1400)) for m in threats), default=0.0)
+    danger = threats and (
+        wounded
+        or len(threats) >= 3
+        or (len(threats) >= 2 and hp_frac < 0.7)
+        or surrounded
+        or (hp_frac < 0.55 and strongest > hp_frac + 0.25)
+        or (len(rear_hits) >= 3 and hp_frac < 0.7)
+    )
+
+    # ---- is a zone shrink coming that we need to get ahead of? ----
+    d_next = _dist2d((x, y), (ncx, ncy))
+    need_in = d_next - next_r * 0.6          # meters until we're comfortably inside the next circle
+    walk = me.get("stats", {}).get("walk_speed", 11.7) * 0.9
+    time_left = max(0.0, zone.get("shrink_start", 1e9) - t)
+    rotate_now = need_in > 0 and time_left < need_in / walk + ROTATE_BUFFER_S
+    shrink_soon = time_left < need_in / walk + ROTATE_BUFFER_S + 25
+    memory["shrink_soon"] = shrink_soon
+
     dx, dy, speed, boost, mode = 0.0, 0.0, 1.0, False, "explore"
     goal, face = None, None
     dodge = _dodge_dir(obs, x, y, z)
@@ -111,18 +153,19 @@ def decide_move(obs, memory):
         dx, dy = dodge
         mode, boost = "dodge", energy > 20
 
-    # ---- 3. Retreat ----
-    elif threats and wounded:
-        tx = sum(m["pos"][0] for m in threats) / len(threats)
-        ty = sum(m["pos"][1] for m in threats) / len(threats)
-        spot = _retreat_spot(gmap, memory, t, x, y, (tx, ty), zone)
+    # ---- 3. Retreat (wounded, outnumbered, surrounded, or losing the fight) ----
+    elif danger:
+        group = [m for d, m in near] if surrounded else threats
+        tx = sum(m["pos"][0] for m in group) / len(group)
+        ty = sum(m["pos"][1] for m in group) / len(group)
+        spot = _retreat_spot(gmap, memory, t, x, y, (tx, ty), zone, [m["pos"] for m in group])
         if spot is not None:
             goal = spot[:2]
         else:
             to_c = _unit(ncx - x, ncy - y)
             ax, ay = _unit(x - tx, y - ty)
             dx, dy = _unit(ax + to_c[0] * 0.6, ay + to_c[1] * 0.6)
-        mode, boost = "retreat", energy > 25
+        mode, boost = ("surrounded" if surrounded else "retreat"), energy > 25
 
     # ---- 4. Fight (only close / incoming enemies; far ones don't stop our farming) ----
     elif engaged or recently_hit_by_mech:
@@ -142,20 +185,37 @@ def decide_move(obs, memory):
         far = _dist2d((x, y), (ncx, ncy)) > next_r * 0.7
         to_c = _unit(ncx - x, ncy - y)
         zp = 0.6 if far else 0.0
-        dx, dy = _unit(sx + bx * k + to_c[0] * zp, sy + by * k + to_c[1] * zp)
+        ox, oy = 0.0, 0.0
+        if len(engaged) >= 2:  # keep them on one side: drift away from the middle of the group
+            gx = sum(mm["pos"][0] for dd, mm in engaged[:3]) / min(3, len(engaged))
+            gy = sum(mm["pos"][1] for dd, mm in engaged[:3]) / min(3, len(engaged))
+            ox, oy = _unit(x - gx, y - gy)
+        dx, dy = _unit(sx + bx * k + to_c[0] * zp + ox * 0.7, sy + by * k + to_c[1] * zp + oy * 0.7)
         mode = "fight"
         # pick up cubes / weapons dropped right next to us even mid-fight
         _grab_adjacent(obs, me, x, y, reach, out)
 
-    # ---- 5. Recover ----
+    # ---- 5. Rotate early to the next circle ----
+    elif rotate_now:
+        goal, mode = (ncx, ncy), "rotate"
+        boost = energy > 40 and time_left < need_in / walk  # running late: sprint
+        _grab_adjacent(obs, me, x, y, reach, out)
+
+    # ---- 6. Recover (heal behind cover; still grab cubes/weapons right next to us) ----
     elif wounded:
-        spot = _cover_near_me(gmap, memory, x, y)
+        spot = _cover_near_me(gmap, memory, x, y, (ncx, ncy, next_r) if shrink_soon else None)
         goal, face = spot[:2], spot[2]
         speed = 0.8 if _dist2d(goal, (x, y)) > 2.5 else 0.0
         mode = "recover"
+        if not enemies:
+            close = [c for c in obs.get("cubes", []) if _dist2d(c["pos"], (x, y)) < 30
+                     and abs(c["pos"][2] - z) < 6]
+            if close:  # a cube heals us (+4% max HP), worth a few steps
+                c = min(close, key=lambda c: _dist2d(c["pos"], (x, y)))
+                goal, face, speed, mode = c["pos"][:2], None, 1.0, "recover-cube"
         _grab_adjacent(obs, me, x, y, reach, out)
 
-    # ---- 6. Farm / 7. Explore ----
+    # ---- 7. Farm / 8. Explore ----
     else:
         f = _pick_farm(obs, me, x, y, reach, hp_frac, zone, memory)
         if f is not None:
@@ -237,10 +297,12 @@ def _pick_farm(obs, me, x, y, reach, hp_frac, zone, memory):
     mem_bad = memory.get("bad_targets", {})
     ccx, ccy = zone["center"]
     safe_r = zone["radius"] - 20
+    ncx, ncy = zone["next_center"]
+    next_lim = zone["next_radius"] * 0.9 if memory.get("shrink_soon") else 1e9
 
     def ok(pos, max_dz):
         return (abs(pos[2] - me["pos"][2]) <= max_dz and _dist2d(pos, (ccx, ccy)) < safe_r
-                and not _bad(mem_bad, pos, t))
+                and _dist2d(pos, (ncx, ncy)) < next_lim and not _bad(mem_bad, pos, t))
 
     weapons = me["weapons"]
     held = {w["kind"] for w in weapons if w}
@@ -426,39 +488,47 @@ def _steer(gmap, x, y, dx, dy, probe=15.0):
     return dx, dy
 
 
-def _cover_near_me(gmap, memory, x, y):
+def _cover_near_me(gmap, memory, x, y, inside=None):
+    """Nearest cover spot (optionally one inside the next circle: inside = (cx, cy, r))."""
+    def fits(p):
+        return inside is None or _dist2d(p, inside[:2]) < inside[2] * 0.8
     spot = memory.get("cover_pt")
-    if spot is not None and _dist2d(spot, (x, y)) < 60:
+    if spot is not None and _dist2d(spot, (x, y)) < 60 and fits(spot):
         return spot
     spot = None
     if gmap is not None:
-        near = gmap.cover_near(x, y, 60.0)
-        if near:
-            spot = near[0][1]
+        for d, p in gmap.cover_near(x, y, 90.0 if inside else 60.0):
+            if fits(p):
+                spot = p
+                break
     if spot is None:
         spot = (x, y, memory.get("move_yaw", 0.0))
     memory["cover_pt"] = spot
     return spot
 
 
-def _retreat_spot(gmap, memory, t, x, y, threat, zone):
+def _retreat_spot(gmap, memory, t, x, y, threat, zone, enemy_pos=None):
+    """Closest cover spot that hides us from as many enemies as possible. Recomputed once a second."""
     if gmap is None:
         return None
     cached = memory.get("retreat")
     if cached and t - cached[0] < 1.0:
         return cached[1]
     ccx, ccy = zone["center"]
-    best, checked = None, 0
+    enemies = (enemy_pos or [threat])[:3]
+    best, best_hidden, checked = None, 0, 0
     for d, p in gmap.cover_near(x, y, 80.0):
         if _dist2d(p, (ccx, ccy)) > zone["radius"] - 15:
             continue
         if _dist2d(p, threat) < _dist2d((x, y), threat) - 10:
             continue
         checked += 1
-        if gmap.blocked(threat, p, step=5.0):
-            best = p
-            break
-        if checked >= 15:
+        hidden = sum(1 for e in enemies if gmap.blocked(e, p, step=5.0))
+        if hidden > best_hidden:
+            best, best_hidden = p, hidden
+            if hidden == len(enemies):
+                break  # hidden from everyone: closest such spot
+        if checked >= 12:
             break
     memory["retreat"] = (t, best)
     if best is not None:

@@ -1,4 +1,4 @@
-"""Main bot (v6, farm then fight): joins movement (where to go) and combat (what to shoot) into one action.
+"""Main bot (v7, farm then fight, survival movement): joins movement (where to go) and combat (what to shoot) into one action.
 
 Owner: Wasilah (integration). movement.py = Wasilah, combat.py = teammate.
 """
@@ -34,7 +34,7 @@ def pick_upgrade(offer):
 
 
 class Bot:
-    name = "glitch-v6"
+    name = "glitch-v7"
 
     def __init__(self, hello):
         cfg = hello["config"]
