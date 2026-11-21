@@ -144,6 +144,22 @@ def decide_move(obs, memory):
         zp = 0.6 if far else 0.0
         dx, dy = _unit(sx + bx * k + to_c[0] * zp, sy + by * k + to_c[1] * zp)
         mode = "fight"
+              # Collect nearby cubes during safe fights.
+        if hp_frac > 0.60 and d > 35 and len(engaged) == 1:
+            nearby_cubes = [
+                c for c in obs.get("cubes", [])
+                if _dist2d(c["pos"], (x, y)) < 15
+                and abs(c["pos"][2] - z) < 4
+                and _dist2d(c["pos"], (ccx, ccy)) < zone["radius"] - 25
+                and _dist2d(c["pos"], m["pos"]) >= d - 3
+            ]
+            if nearby_cubes:
+                cube = min(nearby_cubes,
+                           key=lambda c: _dist2d(c["pos"], (x, y)))
+                p = cube["pos"]
+                if gmap is None or not gmap.blocked(
+                        (x, y), p[:2], step=3.0, walk=True):
+                    dx, dy = _unit(p[0] - x, p[1] - y)
         # pick up cubes / weapons dropped right next to us even mid-fight
         _grab_adjacent(obs, me, x, y, reach, out)
 
