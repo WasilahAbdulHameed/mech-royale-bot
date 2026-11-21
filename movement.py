@@ -369,21 +369,30 @@ def _dodge_dir(obs, x, y, z):
             continue
         if p["kind"] == "npc":
             continue  # slow & weak, not worth breaking our plan
-        rx, ry, rz = x - px, y - py, cz - pz
-        v2 = vx * vx + vy * vy + vz * vz
+        # Predict relative motion, including our current velocity.
+        mvx, mvy, mvz = obs["self"].get("vel", (0, 0, 0))
+        rx, ry = px - x, py - y
+        rvx, rvy = vx - mvx, vy - mvy
+        v2 = rvx * rvx + rvy * rvy
         if v2 < 1:
             continue
-        tca = (rx * vx + ry * vy + rz * vz) / v2
+        tca = -(rx * rvx + ry * rvy) / v2
         if not 0 < tca < 0.5:
             continue
-        mx, my = px + vx * tca - x, py + vy * tca - y
-        if math.hypot(mx, my) < 3.5:
-            sx, sy = _unit(-vy, vx)
+        mx, my = rx + rvx * tca, ry + rvy * tca
+        height = obs["self"].get("stats", {}).get("height", 9.0)
+        radius = obs["self"].get("stats", {}).get("radius", 2.5)
+        hit_z = pz + (vz - mvz) * tca - z
+        if math.hypot(mx, my) < radius + 0.5 and -0.5 <= hit_z <= height + 0.5:
+            sx, sy = _unit(-rvy, rvx)
             if sx * mx + sy * my > 0:
                 sx, sy = -sx, -sy
-            best = (sx, sy)
+            elif abs(sx * mx + sy * my) < 1e-6 and sx * mvx + sy * mvy < 0:
+                sx, sy = -sx, -sy
+            if best is None or tca < best[0]:
+                best = (tca, (sx, sy))
     if best is not None:
-        return best
+        return best[1]
     for m in obs["mechs"]:
         if m["kind"] == "mech" and m.get("charging"):
             bearing_to_me = math.atan2(y - m["pos"][1], x - m["pos"][0])
