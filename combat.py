@@ -1,4 +1,4 @@
-"""Mech Royale v6 combat: survival, farm targets, and cover-aware firing.
+"""Mech Royale v7 combat: improved gun leading and disciplined laser timing.
 
 Only returns aim, fire, reload.
 
@@ -133,7 +133,8 @@ def decide_combat(obs, memory):
     velocity = target.get("vel", [0, 0, 0])
     distance = _d3(muzzle, target_pos)
     current_yaw, current_pitch = me["aim"]
-    tolerance = max(0.025, math.atan2(2.0, max(distance, 1.0)))
+    # A smaller tolerance at midrange avoids shots that miss a strafing mech.
+    tolerance = max(0.018, min(0.06, math.atan2(1.6, max(distance, 1.0))))
 
     # Buildings block direct gun, laser and lightning shots. The map's blocked()
     # method accepts horizontal (x, y) points, as used by movement.py.
@@ -176,9 +177,16 @@ def decide_combat(obs, memory):
         plan = "gun"
 
     gun_speed = gun.get("stats", {}).get("speed", 252) if gun else 252
-    predicted = _lead(muzzle, target_pos, velocity, gun_speed)
-    aim_point = predicted if plan == "gun" else target_pos
-    yaw, pitch = _aim_at(muzzle, aim_point)
+    gun_predicted = _lead(muzzle, target_pos, velocity, gun_speed)
+    gun_yaw, gun_pitch = _aim_at(muzzle, gun_predicted)
+
+    # Hitscan laser and lightning use the current target position rather than
+    # the gun's projectile lead. Track their aim separately from gun aim.
+    direct_yaw, direct_pitch = _aim_at(muzzle, target_pos)
+    if plan == "gun":
+        yaw, pitch = gun_yaw, gun_pitch
+    else:
+        yaw, pitch = direct_yaw, direct_pitch
     out["aim"] = [yaw, pitch]
     aligned = (_angdiff(current_yaw, yaw) < tolerance
                and abs(current_pitch - pitch) < tolerance * 1.5)
@@ -186,7 +194,11 @@ def decide_combat(obs, memory):
     if gun and gun.get("kind") == "gun":
         if gun.get("ammo", 0) == 0 and gun.get("reload", 0) <= 0:
             out["reload"] = True
-        if aligned and not blocked and distance < gun.get("stats", {}).get("range", 230):
+        # Gun must agree with actual aim, even while laser/lightning controls
+        # the torso. Previously it could fire while aimed at the wrong lead.
+        gun_aligned = (_angdiff(current_yaw, gun_yaw) < tolerance
+                       and abs(current_pitch - gun_pitch) < tolerance * 1.5)
+        if gun_aligned and not blocked and distance < gun.get("stats", {}).get("range", 230):
             out["fire"][0] = True
 
     if special and plan == "lightning":
@@ -197,12 +209,18 @@ def decide_combat(obs, memory):
             out["fire"][1] = True
     elif special and plan == "laser" and special.get("cooldown", 0) <= 0:
         charge = special.get("charge", 0)
-        full = special.get("stats", {}).get("charge", 0.75)
-        if charge >= full * 0.95:
-            # False releases an existing charge, even if not perfectly aligned.
-            out["fire"][1] = False
-        else:
+        s = special.get("stats", {})
+        full = max(0.01, s.get("charge", 0.75))
+        hold_limit = full + s.get("hold_s", 2.0)
+        # Charging slows movement: do not begin a new charge while escaping,
+        # healing, or fighting with critically low HP.
+        escaping = memory.get("mode") in ("retreat", "recover", "zone", "dodge")
+        can_start = (not escaping and health_ratio > 0.5 and not blocked)
+        if charge > 0:
+            # Release only once aligned; don't hold so long that the laser
+            # auto-fires at an unwanted angle. The engine fires on release.
+            out["fire"][1] = not (aligned or charge >= hold_limit - 0.15) if charge >= full * 0.95 else True
+        elif can_start:
             out["fire"][1] = True
 
     return out
-
