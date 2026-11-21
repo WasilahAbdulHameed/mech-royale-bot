@@ -1,4 +1,4 @@
-"""Main bot (v8, farm, fight, endgame): joins movement (where to go) and combat (what to shoot) into one action.
+      """Main bot (v8, farm, fight, endgame): joins movement (where to go) and combat (what to shoot) into one action.
 
 Owner: Wasilah (integration). movement.py = Wasilah, combat.py = teammate.
 """
@@ -22,42 +22,6 @@ UPGRADE_DEFS = {}  # id -> full definition from hello.config.upgrades (has the e
 
 
 def pick_upgrade(offer):
-    
-    priorities = {
-        "nanites": 100,
-        "lightning_efficiency": 98,
-        "plating": 95,
-        "gun_mag": 93,
-        "lightning_range": 90,
-        "gun_damage": 88,
-        "armor": 86,
-        "gyros": 84,
-        "laser_damage": 82,
-        "gun_rate": 80,
-        "laser_charge": 76,
-        "reactor": 72,
-        "gun_velocity": 70,
-        "servos": 68,
-        "capacitor": 65,
-        "sensors": 60,
-        "mortar_reload": 58,
-        "mortar_splash": 55,
-        "jets": 50,
-        "mortar_velocity": 48,
-        "lightning_chain": 45,
-        "laser_pierce": 40,
-    }
-
-    choices = offer.get("choices", [])
-    if not choices:
-        return 0
-
-    return max(
-        range(len(choices)),
-        key=lambda i: priorities.get(
-            choices[i].get("id"), 0
-        )
-    )
     best_i, best_score = 0, -1
     for i, ch in enumerate(offer.get("choices", [])):
         d = UPGRADE_DEFS.get(ch.get("id"), {})
