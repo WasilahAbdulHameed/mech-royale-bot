@@ -234,13 +234,23 @@ def decide_move(obs, memory):
                 goal, face, speed, mode = c["pos"][:2], None, 1.0, "recover-cube"
         _grab_adjacent(obs, me, x, y, reach, out)
 
-    # ---- 7. Endgame: sit at the center of the shrinking circle, silent, back to a wall ----
-    elif endgame and not _close_loot(obs, x, y, z):
-        spot = _endgame_spot(gmap, memory, x, y, ncx, ncy, next_r)
-        goal, face = spot[:2], spot[2]
-        d = _dist2d(goal, (x, y))
-        speed = 1.0 if d > 20 else (0.4 if d > 2.0 else 0.0)
-        mode = "endgame"
+    # ---- 7. Endgame: only collect safe, nearby loot; otherwise hold the center ----
+    elif endgame:
+        loot = _endgame_loot(obs, me, x, y, z, ncx, ncy, next_r, reach)
+        if loot is not None:
+            goal, mode = loot["goal"], loot["mode"]
+            if loot.get("take") is not None:
+                out["take"] = loot["take"]
+                if loot.get("drop") is not None:
+                    out["drop"] = loot["drop"]
+            if _dist2d(goal, (x, y)) < 1.5:
+                speed = 0.0
+        else:
+            spot = _endgame_spot(gmap, memory, x, y, ncx, ncy, next_r)
+            goal, face = spot[:2], spot[2]
+            d = _dist2d(goal, (x, y))
+            speed = 1.0 if d > 20 else (0.4 if d > 2.0 else 0.0)
+            mode = "endgame"
 
     # ---- 8. Farm / 9. Explore ----
     else:
@@ -313,12 +323,47 @@ def decide_move(obs, memory):
 
 # ---------------- endgame ----------------
 
-def _close_loot(obs, x, y, z, r=25.0):
-    """Cubes or weapons right next to us are still worth grabbing in the endgame."""
-    for c in obs.get("cubes", []) + obs.get("pickups", []):
-        if _dist2d(c["pos"], (x, y)) < r and abs(c["pos"][2] - z) < 6:
-            return True
-    return False
+def _endgame_loot(obs, me, x, y, z, ncx, ncy, next_r, reach):
+    """Only leave the endgame center for nearby, reachable cubes or a useful weapon.
+
+    No drone hunts, crates, or distant supplies when the circle is tiny.
+    """
+    if next_r <= 8.0:  # final collapse: standing near center is more important than loot
+        return None
+
+    # Stay comfortably inside the upcoming circle and within 25 m of our location.
+    center_limit = next_r * 0.55
+    def close(p):
+        return (_dist2d(p, (x, y)) <= 25.0
+                and _dist2d(p, (ncx, ncy)) < center_limit
+                and abs(p[2] - z) < 4.0)
+
+    cubes = [c for c in obs.get("cubes", []) if close(c["pos"])]
+    if cubes:
+        c = min(cubes, key=lambda c: _dist2d(c["pos"], (x, y)))
+        return {"goal": c["pos"][:2], "mode": "endgame-cube"}
+
+    held = {w["kind"] for w in me.get("weapons", []) if w}
+    weapons = me.get("weapons", [])
+    slot1 = weapons[1] if len(weapons) > 1 else None
+    available = []
+    for p in obs.get("pickups", []):
+        k = p["kind"]
+        if (not close(p["pos"]) or k in held or k not in WEAPON_PREF
+                or (slot1 is not None and (slot1["kind"] != "mortar"
+                    or WEAPON_PREF[k] <= WEAPON_PREF["mortar"]
+                    or slot1.get("charge", 0) > 0))):
+            continue
+        available.append(p)
+    if available:
+        p = min(available, key=lambda p: _dist2d(p["pos"], (x, y)))
+        result = {"goal": p["pos"][:2], "mode": "endgame-weapon"}
+        if _dist2d(p["pos"], (x, y)) < reach * 0.9:
+            result["take"] = p["id"]
+            if slot1 is not None:
+                result["drop"] = 1
+        return result
+    return None
 
 
 def _endgame_spot(gmap, memory, x, y, ncx, ncy, next_r):
@@ -588,3 +633,4 @@ def _retreat_spot(gmap, memory, t, x, y, threat, zone, enemy_pos=None):
     if best is not None:
         memory["cover_pt"] = best
     return best
+   
