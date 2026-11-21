@@ -22,7 +22,7 @@ import random
 RETREAT_HP = 0.35      # retreat below this HP fraction...
 RECOVER_TO = 0.80      # ...and recover until healed to this
 DANGER_RANGE = 90.0
-FIGHT_RANGE = 110.0    # only switch to fight mode for enemies this close (or ones shooting us / coming at us)
+FIGHT_RANGE = 80.0    # only switch to fight mode for enemies this close (or ones shooting us / coming at us)
 FIGHT_MIN, FIGHT_MAX = 30.0, 80.0   # preferred distance with just the gun
 CLOSE_MIN, CLOSE_MAX = 12.0, 32.0   # preferred distance with lightning (45 m range)
 WEAPON_RANGE = 160.0   # walk this far for a weapon
@@ -464,4 +464,3 @@ def _retreat_spot(gmap, memory, t, x, y, threat, zone):
     if best is not None:
         memory["cover_pt"] = best
     return best
-   
