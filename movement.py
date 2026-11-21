@@ -1,4 +1,4 @@
-"""Movement v5 (owner: Wasilah): FARM, then FIGHT.
+"""Movement v6 (owner: Wasilah): FARM, then FIGHT.
 
 decide_move(obs, memory) -> dict with ONLY: move, boost, jump, take, drop
 It also sets memory["farm_target"] (an NPC drone or crate id) for combat.py to shoot.
@@ -22,6 +22,7 @@ import random
 RETREAT_HP = 0.35      # retreat below this HP fraction...
 RECOVER_TO = 0.80      # ...and recover until healed to this
 DANGER_RANGE = 90.0
+FIGHT_RANGE = 110.0    # only switch to fight mode for enemies this close (or ones shooting us / coming at us)
 FIGHT_MIN, FIGHT_MAX = 30.0, 80.0   # preferred distance with just the gun
 CLOSE_MIN, CLOSE_MAX = 12.0, 32.0   # preferred distance with lightning (45 m range)
 WEAPON_RANGE = 160.0   # walk this far for a weapon
@@ -72,6 +73,11 @@ def decide_move(obs, memory):
     if enemies:
         memory["last_enemy_t"] = t
 
+    def coming_at_us(m, d):
+        vx, vy = m["vel"][0], m["vel"][1]
+        return d < 190 and (vx * (x - m["pos"][0]) + vy * (y - m["pos"][1])) / max(d, 1.0) > 4.0
+    engaged = [(d, m) for d, m in enemy_d if d < FIGHT_RANGE or coming_at_us(m, d)]
+
     for ev in obs.get("events", []):
         if ev.get("type") == "damaged" and ev.get("bearing") is not None:
             memory["hit_t"] = t
@@ -118,12 +124,11 @@ def decide_move(obs, memory):
             dx, dy = _unit(ax + to_c[0] * 0.6, ay + to_c[1] * 0.6)
         mode, boost = "retreat", energy > 25
 
-    # ---- 4. Fight ----
-    elif enemies or recently_hit_by_mech:
-        if enemies:
-            m = enemy_d[0][1]
+    # ---- 4. Fight (only close / incoming enemies; far ones don't stop our farming) ----
+    elif engaged or recently_hit_by_mech:
+        if engaged:
+            d, m = engaged[0]
             bx, by = _unit(m["pos"][0] - x, m["pos"][1] - y)
-            d = enemy_d[0][0]
         else:
             b = memory["hit_bearing"]
             bx, by, d = math.cos(b), math.sin(b), 60.0
