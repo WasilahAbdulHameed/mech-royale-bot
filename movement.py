@@ -22,7 +22,7 @@ import random
 RETREAT_HP = 0.35      # retreat below this HP fraction...
 RECOVER_TO = 0.80      # ...and recover until healed to this
 DANGER_RANGE = 90.0
-FIGHT_RANGE = 80.0 # only switch to fight mode for enemies this close (or ones shooting us / coming at us)
+FIGHT_RANGE = 80.0    # only switch to fight mode for enemies this close (or ones shooting us / coming at us)
 FIGHT_MIN, FIGHT_MAX = 30.0, 80.0   # preferred distance with just the gun
 CLOSE_MIN, CLOSE_MAX = 12.0, 32.0   # preferred distance with lightning (45 m range)
 WEAPON_RANGE = 160.0   # walk this far for a weapon
@@ -37,7 +37,6 @@ WEAPON_PREF = {"lightning": 3, "laser": 2, "mortar": 1}
 
 def _dist2d(a, b):
     return math.hypot(a[0] - b[0], a[1] - b[1])
-
 
 def _unit(x, y):
     n = math.hypot(x, y)
@@ -144,22 +143,6 @@ def decide_move(obs, memory):
         zp = 0.6 if far else 0.0
         dx, dy = _unit(sx + bx * k + to_c[0] * zp, sy + by * k + to_c[1] * zp)
         mode = "fight"
-              # Collect nearby cubes during safe fights.
-        if hp_frac > 0.60 and d > 35 and len(engaged) == 1:
-            nearby_cubes = [
-                c for c in obs.get("cubes", [])
-                if _dist2d(c["pos"], (x, y)) < 15
-                and abs(c["pos"][2] - z) < 4
-                and _dist2d(c["pos"], (ccx, ccy)) < zone["radius"] - 25
-                and _dist2d(c["pos"], m["pos"]) >= d - 3
-            ]
-            if nearby_cubes:
-                cube = min(nearby_cubes,
-                           key=lambda c: _dist2d(c["pos"], (x, y)))
-                p = cube["pos"]
-                if gmap is None or not gmap.blocked(
-                        (x, y), p[:2], step=3.0, walk=True):
-                    dx, dy = _unit(p[0] - x, p[1] - y)
         # pick up cubes / weapons dropped right next to us even mid-fight
         _grab_adjacent(obs, me, x, y, reach, out)
 
@@ -261,7 +244,18 @@ def _pick_farm(obs, me, x, y, reach, hp_frac, zone, memory):
     weapons = me["weapons"]
     held = {w["kind"] for w in weapons if w}
     slot1 = weapons[1] if len(weapons) > 1 else None
-
+    # Priority supply drop when injured or still gaining power.
+    for dr in obs.get("drops", []):
+        p = dr["pos"]
+        d = _dist2d(p, (x, y))
+        if (
+            d < 140
+            and dr.get("lands_in", 99) <= d / 11.0 + 2
+            and dr.get("holder") in (None, me["id"])
+            and _dist2d(p, zone["center"]) < zone["radius"] - 25
+            and (hp_frac < 0.85 or me.get("cubes", 0) < 10)
+        ):
+            return {"goal": p[:2], "mode": "supply-drop"}
     # 1) weapons: fill the empty slot, or swap a mortar for lightning/laser
     best, best_score = None, -1e9
     for p in obs.get("pickups", []):
@@ -293,7 +287,7 @@ def _pick_farm(obs, me, x, y, reach, hp_frac, zone, memory):
     if cubes:
         c = min(cubes, key=lambda c: _dist2d(c["pos"], (x, y)))
         return {"goal": c["pos"][:2], "mode": "cube"}
-
+   
     # 3) supply drop (full HP + 3 cubes) if we can get there around landing time
     for dr in obs.get("drops", []):
         d = _dist2d(dr["pos"], (x, y))
@@ -369,30 +363,21 @@ def _dodge_dir(obs, x, y, z):
             continue
         if p["kind"] == "npc":
             continue  # slow & weak, not worth breaking our plan
-        # Predict relative motion, including our current velocity.
-        mvx, mvy, mvz = obs["self"].get("vel", (0, 0, 0))
-        rx, ry = px - x, py - y
-        rvx, rvy = vx - mvx, vy - mvy
-        v2 = rvx * rvx + rvy * rvy
+        rx, ry, rz = x - px, y - py, cz - pz
+        v2 = vx * vx + vy * vy + vz * vz
         if v2 < 1:
             continue
-        tca = -(rx * rvx + ry * rvy) / v2
+        tca = (rx * vx + ry * vy + rz * vz) / v2
         if not 0 < tca < 0.5:
             continue
-        mx, my = rx + rvx * tca, ry + rvy * tca
-        height = obs["self"].get("stats", {}).get("height", 9.0)
-        radius = obs["self"].get("stats", {}).get("radius", 2.5)
-        hit_z = pz + (vz - mvz) * tca - z
-        if math.hypot(mx, my) < radius + 0.5 and -0.5 <= hit_z <= height + 0.5:
-            sx, sy = _unit(-rvy, rvx)
+        mx, my = px + vx * tca - x, py + vy * tca - y
+        if math.hypot(mx, my) < 3.5:
+            sx, sy = _unit(-vy, vx)
             if sx * mx + sy * my > 0:
                 sx, sy = -sx, -sy
-            elif abs(sx * mx + sy * my) < 1e-6 and sx * mvx + sy * mvy < 0:
-                sx, sy = -sx, -sy
-            if best is None or tca < best[0]:
-                best = (tca, (sx, sy))
+            best = (sx, sy)
     if best is not None:
-        return best[1]
+        return best
     for m in obs["mechs"]:
         if m["kind"] == "mech" and m.get("charging"):
             bearing_to_me = math.atan2(y - m["pos"][1], x - m["pos"][0])
