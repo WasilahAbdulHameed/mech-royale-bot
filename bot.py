@@ -1,4 +1,4 @@
-"""Main bot (v2): joins movement (where to go) and combat (what to shoot) into one action.
+"""Main bot (v4): joins movement (where to go) and combat (what to shoot) into one action.
 
 Owner: Wasilah (integration). movement.py = Wasilah, combat.py = teammate.
 """
@@ -12,16 +12,21 @@ import movement
 
 # Upgrade preference: survival first. Words are matched against the upgrade's id/name/desc.
 UPGRADE_WORDS = [
-    ("armor", 10), ("damage taken", 10), ("hp", 8), ("health", 8), ("regen", 7),
-    ("sensor", 5), ("vision", 5), ("speed", 4), ("energy", 3),
-    ("fire rate", 3), ("damage", 2),
+    ("armor", 10), ("damage taken", 10), ("regen", 8), ("hp", 8), ("health", 8),
+    ("fire rate", 6), ("damage", 6), ("reload", 5), ("sensor", 4), ("vision", 4),
+    ("speed", 3), ("energy", 3),
 ]
+
+
+UPGRADE_DEFS = {}  # id -> full definition from hello.config.upgrades (has the exact stat paths)
 
 
 def pick_upgrade(offer):
     best_i, best_score = 0, -1
     for i, ch in enumerate(offer.get("choices", [])):
-        text = f"{ch.get('id', '')} {ch.get('name', '')} {ch.get('desc', '')}".lower()
+        d = UPGRADE_DEFS.get(ch.get("id"), {})
+        paths = " ".join(e.get("path", "") for e in d.get("effects", []))
+        text = f"{ch.get('id', '')} {ch.get('name', '')} {ch.get('desc', '')} {paths}".lower()
         score = sum(w for word, w in UPGRADE_WORDS if word in text)
         if score > best_score:
             best_i, best_score = i, score
@@ -29,11 +34,14 @@ def pick_upgrade(offer):
 
 
 class Bot:
-    name = "survivor-bot"
+    name = "glitch-v4"
 
     def __init__(self, hello):
         cfg = hello["config"]
         random.seed(hello.get("seed", 0))
+        for u in cfg.get("upgrades", []) or []:
+            if isinstance(u, dict) and "id" in u:
+                UPGRADE_DEFS[u["id"]] = u
         # `memory` is shared by movement and combat and lives for the whole match
         self.memory = {
             "cfg": cfg,

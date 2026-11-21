@@ -1,8 +1,9 @@
 """Map helper (owner: Wasilah). Reads /arena/v2/world.json once at match start.
 
-Gives movement.py three things:
-  - in_building(x, y)        : is this spot inside a building footprint?
-  - blocked(a, b)            : does a building stand between points a and b? (2D line check)
+Gives movement.py these things:
+  - in_building(x, y)        : is this spot inside a building tall enough to hide behind (8 m+)?
+  - blocked(a, b)            : does such a building stand between points a and b? (2D line check)
+  - blocked(a, b, walk=True) : same, but counting EVERY wall a mech can't step over (1.2 m+), for steering
   - cover_near(x, y, r)      : "cover spots" = points 5 m outside building walls, with the
                                direction facing away from the wall (back to the wall = no rear hits)
 If the map can't be loaded, `ok` is False and movement.py falls back to map-free behaviour.
@@ -13,6 +14,7 @@ import os
 
 CELL = 25.0          # grid cell size (m) for fast lookups
 MIN_HEIGHT = 8.0     # buildings shorter than this don't hide a 9 m mech
+WALK_HEIGHT = 1.5    # anything taller than this is a wall when walking (step_up is 1.2 m)
 COVER_STEP = 12.0    # one cover spot every N meters of wall
 COVER_OFFSET = 5.0   # how far from the wall the spot is (mech radius is 2.5 m)
 
@@ -38,7 +40,9 @@ class MapData:
     def __init__(self, map_dir):
         self.ok = False
         self.prisms = []      # (minx, miny, maxx, maxy, ring_pts, holes_pts_list)
-        self.grid = {}        # (cx, cy) -> [prism index]
+        self.grid = {}        # (cx, cy) -> [prism index], tall buildings (hide / block shots)
+        self.walls = []       # every building/stadium a mech can't walk over
+        self.wall_grid = {}
         self.cover = []       # (x, y, face_yaw)
         self.cover_grid = {}  # (cx, cy) -> [cover index]
         try:
@@ -55,7 +59,8 @@ class MapData:
         for pr in world.get("prisms", []):
             if pr.get("kind") not in ("building", "stadium"):
                 continue  # bridges: you can walk and shoot under them
-            if pr.get("top", 0) - pr.get("base", 0) < MIN_HEIGHT:
+            h = pr.get("top", 0) - pr.get("base", 0)
+            if h < WALK_HEIGHT:
                 continue
             ring = _ring_pts(pr.get("ring", []))
             if len(ring) < 3:
@@ -63,14 +68,22 @@ class MapData:
             holes_raw = pr.get("holes") or []
             if holes_raw and not isinstance(holes_raw[0], list):
                 holes_raw = [holes_raw]
-            holes = [_ring_pts(h) for h in holes_raw if len(h) >= 6]
+            holes = [_ring_pts(hh) for hh in holes_raw if len(hh) >= 6]
             xs = [p[0] for p in ring]
             ys = [p[1] for p in ring]
+            entry = (min(xs), min(ys), max(xs), max(ys), ring, holes)
+            cells = [(cx, cy) for cx in range(int(min(xs) // CELL), int(max(xs) // CELL) + 1)
+                     for cy in range(int(min(ys) // CELL), int(max(ys) // CELL) + 1)]
+            wi = len(self.walls)
+            self.walls.append(entry)
+            for c in cells:
+                self.wall_grid.setdefault(c, []).append(wi)
+            if h < MIN_HEIGHT:
+                continue
             idx = len(self.prisms)
-            self.prisms.append((min(xs), min(ys), max(xs), max(ys), ring, holes))
-            for cx in range(int(min(xs) // CELL), int(max(xs) // CELL) + 1):
-                for cy in range(int(min(ys) // CELL), int(max(ys) // CELL) + 1):
-                    self.grid.setdefault((cx, cy), []).append(idx)
+            self.prisms.append(entry)
+            for c in cells:
+                self.grid.setdefault(c, []).append(idx)
         for idx, (_, _, _, _, ring, _) in enumerate(self.prisms):
             self._add_cover(ring)
 
@@ -92,28 +105,29 @@ class MapData:
                 f = (k + 0.5) / n
                 px = x1 + ex * f + nx * COVER_OFFSET
                 py = y1 + ey * f + ny * COVER_OFFSET
-                if self.in_building(px, py):
+                if self.in_building(px, py, walk=True):
                     continue  # spot lands inside another building
                 ci = len(self.cover)
                 self.cover.append((px, py, math.atan2(ny, nx)))
                 self.cover_grid.setdefault((int(px // CELL), int(py // CELL)), []).append(ci)
 
     # ---------- queries ----------
-    def in_building(self, x, y):
-        for idx in self.grid.get((int(x // CELL), int(y // CELL)), ()):
-            minx, miny, maxx, maxy, ring, holes = self.prisms[idx]
+    def in_building(self, x, y, walk=False):
+        grid, items = (self.wall_grid, self.walls) if walk else (self.grid, self.prisms)
+        for idx in grid.get((int(x // CELL), int(y // CELL)), ()):
+            minx, miny, maxx, maxy, ring, holes = items[idx]
             if minx <= x <= maxx and miny <= y <= maxy and _inside(x, y, ring):
                 if not any(_inside(x, y, h) for h in holes):
                     return True
         return False
 
-    def blocked(self, a, b, step=4.0):
+    def blocked(self, a, b, step=4.0, walk=False):
         """True if a building stands on the straight 2D line between a and b."""
         d = math.hypot(b[0] - a[0], b[1] - a[1])
         n = int(d // step)
         for i in range(1, n):
             f = i / n
-            if self.in_building(a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f):
+            if self.in_building(a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, walk):
                 return True
         return False
 
