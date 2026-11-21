@@ -1,4 +1,23 @@
-"""Movement v7 (owner: Wasilah): FARM, then FIGHT, and don't get caught out.
+"""Movement v8 (owner: Wasilah): v7b + ENDGAME.
+
+v8 endgame: the zone closes to 0 m at ~6:55 and whoever has the most HP lasts longest.
+When the next circle is small (<= 70 m radius):
+  - stop wandering: go to the next circle's center, preferably a cover spot right next to it,
+    and stand still (silent) instead of exploring or farming far away
+  - only farm cubes/weapons very close by (cubes = more max HP)
+  - fights pull hard toward the center so we never get pushed out of the tiny circle
+  - the "near the edge" buffer scales with the circle so we don't panic in a small zone
+
+v7b notes: FARM, then FIGHT. v6 fighting + the safe parts of v7.
+
+v7 scored lower than v6 (2.90 vs 4.08), most likely because its extra retreat rules made the bot
+run instead of fighting - and in practice the hunters chase us, so running costs kills.
+v7b goes back to v6's rule (retreat only when badly hurt) but keeps from v7:
+  - only truly surrounded (enemies on opposite sides, 3+ of them) triggers an early retreat
+  - early rotation to the next circle + no farming outside it when a shrink is coming
+  - grabbing cubes while healing, and keeping 2 enemies on one side during fights
+
+Original v7 notes:
 
 v7 changes (survival):
   1. Avoids getting surrounded: 2+ enemies on different sides -> back off to cover that blocks most of them.
@@ -32,7 +51,8 @@ RECOVER_TO = 0.80      # ...and recover until healed to this
 DANGER_RANGE = 90.0
 SURROUND_RANGE = 120.0  # enemies this close count toward "being surrounded"
 SURROUND_SPREAD = math.radians(100)  # enemies spread over more than this angle = surrounded
-ROTATE_BUFFER_S = 15.0  # arrive inside the next circle this many seconds before the shrink
+ROTATE_BUFFER_S = 15.0
+ENDGAME_RADIUS = 70.0   # next circle this small or smaller = endgame  # arrive inside the next circle this many seconds before the shrink
 FIGHT_RANGE = 110.0    # only switch to fight mode for enemies this close (or ones shooting us / coming at us)
 FIGHT_MIN, FIGHT_MAX = 30.0, 80.0   # preferred distance with just the gun
 CLOSE_MIN, CLOSE_MAX = 12.0, 32.0   # preferred distance with lightning (45 m range)
@@ -121,14 +141,8 @@ def decide_move(obs, memory):
         gaps = [angs[i + 1] - angs[i] for i in range(len(angs) - 1)] + [angs[0] + 2 * math.pi - angs[-1]]
         surrounded = (2 * math.pi - max(gaps)) > SURROUND_SPREAD  # how wide an arc they cover
     strongest = max((m.get("hp", 1400) / max(1.0, m.get("max_hp", 1400)) for m in threats), default=0.0)
-    danger = threats and (
-        wounded
-        or len(threats) >= 3
-        or (len(threats) >= 2 and hp_frac < 0.7)
-        or surrounded
-        or (hp_frac < 0.55 and strongest > hp_frac + 0.25)
-        or (len(rear_hits) >= 3 and hp_frac < 0.7)
-    )
+    # v7b: like v6, retreat when badly hurt; otherwise only when truly surrounded by 3+ enemies
+    danger = threats and (wounded or (surrounded and len(near) >= 3 and hp_frac < 0.8))
 
     # ---- is a zone shrink coming that we need to get ahead of? ----
     d_next = _dist2d((x, y), (ncx, ncy))
@@ -143,8 +157,11 @@ def decide_move(obs, memory):
     goal, face = None, None
     dodge = _dodge_dir(obs, x, y, z)
 
+    endgame = next_r <= ENDGAME_RADIUS
+    edge_buffer = min(ZONE_EDGE_BUFFER, zone["radius"] * 0.35)
+
     # ---- 1. Zone ----
-    if not me["in_zone"] or margin < ZONE_EDGE_BUFFER:
+    if not me["in_zone"] or margin < edge_buffer:
         goal, mode = (ncx, ncy), "zone"
         boost = (not me["in_zone"] or margin < 10) and energy > 10
 
@@ -185,6 +202,8 @@ def decide_move(obs, memory):
         far = _dist2d((x, y), (ncx, ncy)) > next_r * 0.7
         to_c = _unit(ncx - x, ncy - y)
         zp = 0.6 if far else 0.0
+        if endgame and d_next > next_r * 0.5:
+            zp = 1.5  # tiny circle: never get pushed out while fighting
         ox, oy = 0.0, 0.0
         if len(engaged) >= 2:  # keep them on one side: drift away from the middle of the group
             gx = sum(mm["pos"][0] for dd, mm in engaged[:3]) / min(3, len(engaged))
@@ -215,7 +234,15 @@ def decide_move(obs, memory):
                 goal, face, speed, mode = c["pos"][:2], None, 1.0, "recover-cube"
         _grab_adjacent(obs, me, x, y, reach, out)
 
-    # ---- 7. Farm / 8. Explore ----
+    # ---- 7. Endgame: sit at the center of the shrinking circle, silent, back to a wall ----
+    elif endgame and not _close_loot(obs, x, y, z):
+        spot = _endgame_spot(gmap, memory, x, y, ncx, ncy, next_r)
+        goal, face = spot[:2], spot[2]
+        d = _dist2d(goal, (x, y))
+        speed = 1.0 if d > 20 else (0.4 if d > 2.0 else 0.0)
+        mode = "endgame"
+
+    # ---- 8. Farm / 9. Explore ----
     else:
         f = _pick_farm(obs, me, x, y, reach, hp_frac, zone, memory)
         if f is not None:
@@ -282,6 +309,33 @@ def decide_move(obs, memory):
 
     out.update(move=[dx * speed, dy * speed], boost=bool(boost), jump=bool(jump))
     return out
+
+
+# ---------------- endgame ----------------
+
+def _close_loot(obs, x, y, z, r=25.0):
+    """Cubes or weapons right next to us are still worth grabbing in the endgame."""
+    for c in obs.get("cubes", []) + obs.get("pickups", []):
+        if _dist2d(c["pos"], (x, y)) < r and abs(c["pos"][2] - z) < 6:
+            return True
+    return False
+
+
+def _endgame_spot(gmap, memory, x, y, ncx, ncy, next_r):
+    """A spot at the center of the next circle; a cover spot if one is close enough to the center."""
+    limit = max(6.0, next_r * 0.35)
+    spot = memory.get("end_pt")
+    if spot is not None and _dist2d(spot, (ncx, ncy)) <= limit:
+        return spot
+    spot = None
+    if gmap is not None:
+        for d, p in gmap.cover_near(ncx, ncy, limit):
+            spot = p  # nearest cover to the center
+            break
+    if spot is None:
+        spot = (ncx, ncy, memory.get("move_yaw", 0.0))
+    memory["end_pt"] = spot
+    return spot
 
 
 # ---------------- farming ----------------
