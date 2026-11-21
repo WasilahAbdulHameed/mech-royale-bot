@@ -1,37 +1,37 @@
-"""Movement & survival v4 (owner: Wasilah).
+"""Movement v5 (owner: Wasilah): FARM, then FIGHT.
 
-decide_move(obs, memory) -> dict with ONLY: move, boost, jump, take
+decide_move(obs, memory) -> dict with ONLY: move, boost, jump, take, drop
+It also sets memory["farm_target"] (an NPC drone or crate id) for combat.py to shoot.
 
-The loop that wins: FIGHT a hunter -> when hurt, BREAK LINE OF SIGHT behind a building
--> RECOVER (HP regenerates 45/s after 5 s without damage) -> fight the next one.
+Why: in practice the 15 house bots never kill each other, so every bot that dies before
+us is one WE killed. Points = kills. So: get strong first (weapons, cubes), then win fights.
 
 Modes, in priority order each tick:
   zone     : outside / near the edge of the safe zone -> go in
   dodge    : a bullet, mortar shell or charged laser is about to hit us -> sidestep
-  retreat  : low HP or swarmed -> run to a spot with a building between us and them
-  fight    : enemies in view, HP ok -> strafe unpredictably at a good distance
-  recover  : hurt, nobody in view -> sit still behind cover until healed
-  loot     : safe -> weapons, cubes, supply drops
-  hold     : park with our back to a wall inside the next circle (silent)
+  retreat  : wounded and enemies near -> run to a spot behind a building
+  fight    : enemy mechs in view -> strafe at a good distance (closer if we have lightning)
+  recover  : wounded, nobody in view -> sit still behind cover until healed
+  farm     : weapons > cubes > supply drop > NPC drones > crates
+  explore  : nothing visible -> walk to a new spot inside the next circle, looking around
 """
 import math
 import random
 
 # ---- tuning knobs ----
-RETREAT_HP = 0.40      # retreat below this HP fraction...
-RECOVER_TO = 0.85      # ...and don't go looking for trouble until healed to this
-SWARM = 3              # this many enemies within DANGER_RANGE -> retreat even if healthy
+RETREAT_HP = 0.35      # retreat below this HP fraction...
+RECOVER_TO = 0.80      # ...and recover until healed to this
 DANGER_RANGE = 90.0
-FIGHT_MIN, FIGHT_MAX = 35.0, 90.0   # preferred fight distance (gun)
-CLOSE_MIN, CLOSE_MAX = 15.0, 35.0   # preferred fight distance when we hold lightning
-LOOT_SAFE_RANGE = 120.0
-CUBE_RANGE = 60.0
-PICKUP_RANGE = 70.0
-NPC_AVOID = 55.0
+FIGHT_MIN, FIGHT_MAX = 30.0, 80.0   # preferred distance with just the gun
+CLOSE_MIN, CLOSE_MAX = 12.0, 32.0   # preferred distance with lightning (45 m range)
+WEAPON_RANGE = 160.0   # walk this far for a weapon
+CUBE_RANGE = 110.0
+NPC_RANGE = 160.0      # go hunt drones this far away
+NPC_SHOOT_DIST = 55.0  # stand this far from a drone while shooting it
+CRATE_RANGE = 120.0
+CRATE_SHOOT_DIST = 14.0
 ZONE_EDGE_BUFFER = 25.0
-HOLD_FRACTION = 0.5
-SNEAK = 0.4            # below 5 m/s = no footstep sound
-WEAPON_PREF = {"laser": 3, "lightning": 3, "mortar": 1}
+WEAPON_PREF = {"lightning": 3, "laser": 2, "mortar": 1}
 
 
 def _dist2d(a, b):
@@ -64,11 +64,10 @@ def decide_move(obs, memory):
     if gmap is not None and not gmap.ok:
         gmap = None
     out = {}
+    memory["farm_target"] = None
 
     enemies = [m for m in obs["mechs"] if m["kind"] == "mech"]
-    npcs = [m for m in obs["mechs"] if m["kind"] == "npc"]
     enemy_d = sorted(((_dist2d(m["pos"], (x, y)), m) for m in enemies), key=lambda p: p[0])
-    nearest_enemy = enemy_d[0][0] if enemy_d else 1e9
     threats = [m for d, m in enemy_d if d < DANGER_RANGE]
     if enemies:
         memory["last_enemy_t"] = t
@@ -77,9 +76,9 @@ def decide_move(obs, memory):
         if ev.get("type") == "damaged" and ev.get("bearing") is not None:
             memory["hit_t"] = t
             memory["hit_bearing"] = ev["bearing"]
-    recently_hit = t - memory.get("hit_t", -99) < 2.0
+            memory["hit_by_mech"] = ev.get("by") is not None and ev["by"] < 100
+    recently_hit_by_mech = t - memory.get("hit_t", -99) < 2.0 and memory.get("hit_by_mech")
 
-    # "wounded" sticks until we've healed back up (hysteresis, so we don't flip-flop)
     if hp_frac < RETREAT_HP:
         memory["wounded"] = True
     elif hp_frac >= RECOVER_TO:
@@ -90,42 +89,37 @@ def decide_move(obs, memory):
     next_r = zone["next_radius"]
     ccx, ccy = zone["center"]
     margin = zone["radius"] - _dist2d((x, y), (ccx, ccy))
-    to_next = _unit(ncx - x, ncy - y)
-    far_from_next = _dist2d((x, y), (ncx, ncy)) > next_r * 0.6
     has_lightning = any(w and w["kind"] == "lightning" for w in me["weapons"])
 
-    dx, dy, speed, boost, mode = 0.0, 0.0, SNEAK, False, "hold"
-    face, goal = None, None
-    dodge = _dodge_dir(obs, me, x, y, z)
+    dx, dy, speed, boost, mode = 0.0, 0.0, 1.0, False, "explore"
+    goal, face = None, None
+    dodge = _dodge_dir(obs, x, y, z)
 
     # ---- 1. Zone ----
     if not me["in_zone"] or margin < ZONE_EDGE_BUFFER:
-        goal = (ncx, ncy)
-        speed, mode = 1.0, "zone"
+        goal, mode = (ncx, ncy), "zone"
         boost = (not me["in_zone"] or margin < 10) and energy > 10
 
     # ---- 2. Dodge ----
     elif dodge is not None:
         dx, dy = dodge
-        speed, mode = 1.0, "dodge"
-        boost = energy > 20
+        mode, boost = "dodge", energy > 20
 
-    # ---- 3. Retreat behind a building ----
-    elif threats and (wounded or len(threats) >= SWARM):
+    # ---- 3. Retreat ----
+    elif threats and wounded:
         tx = sum(m["pos"][0] for m in threats) / len(threats)
         ty = sum(m["pos"][1] for m in threats) / len(threats)
         spot = _retreat_spot(gmap, memory, t, x, y, (tx, ty), zone)
         if spot is not None:
             goal = spot[:2]
         else:
+            to_c = _unit(ncx - x, ncy - y)
             ax, ay = _unit(x - tx, y - ty)
-            pull = 1.5 if far_from_next else 0.4
-            dx, dy = _unit(ax + to_next[0] * pull, ay + to_next[1] * pull)
-        speed, mode = 1.0, "retreat"
-        boost = energy > 25
+            dx, dy = _unit(ax + to_c[0] * 0.6, ay + to_c[1] * 0.6)
+        mode, boost = "retreat", energy > 25
 
-    # ---- 4. Fight: strafe with random timing at a good distance ----
-    elif enemies or recently_hit:
+    # ---- 4. Fight ----
+    elif enemies or recently_hit_by_mech:
         if enemies:
             m = enemy_d[0][1]
             bx, by = _unit(m["pos"][0] - x, m["pos"][1] - y)
@@ -135,72 +129,85 @@ def decide_move(obs, memory):
             bx, by, d = math.cos(b), math.sin(b), 60.0
         if t >= memory.get("strafe_until", -1):
             memory["strafe_side"] = -memory.get("strafe_side", 1)
-            memory["strafe_until"] = t + random.uniform(0.6, 1.6)  # unpredictable -> hard to lead
+            memory["strafe_until"] = t + random.uniform(0.5, 1.4)
         side = memory.get("strafe_side", 1)
         sx, sy = -by * side, bx * side
         lo, hi = (CLOSE_MIN, CLOSE_MAX) if has_lightning else (FIGHT_MIN, FIGHT_MAX)
-        k = -0.7 if d < lo else (0.6 if d > hi else 0.0)
-        zp = 0.6 if far_from_next else 0.0
-        dx, dy = _unit(sx + bx * k + to_next[0] * zp, sy + by * k + to_next[1] * zp)
-        speed, mode = 1.0, "fight"
+        k = -0.8 if d < lo else (0.8 if d > hi else 0.0)
+        far = _dist2d((x, y), (ncx, ncy)) > next_r * 0.7
+        to_c = _unit(ncx - x, ncy - y)
+        zp = 0.6 if far else 0.0
+        dx, dy = _unit(sx + bx * k + to_c[0] * zp, sy + by * k + to_c[1] * zp)
+        mode = "fight"
+        # pick up cubes / weapons dropped right next to us even mid-fight
+        _grab_adjacent(obs, me, x, y, reach, out)
 
-    # ---- 5. Recover: still and hidden until healed ----
+    # ---- 5. Recover ----
     elif wounded:
-        spot = _hold_spot(gmap, memory, x, y, ncx, ncy, next_r, near_only=True)
+        spot = _cover_near_me(gmap, memory, x, y)
         goal, face = spot[:2], spot[2]
-        d = _dist2d(goal, (x, y))
-        speed, mode = (0.8 if d > 2.5 else 0.0), "recover"
+        speed = 0.8 if _dist2d(goal, (x, y)) > 2.5 else 0.0
+        mode = "recover"
+        _grab_adjacent(obs, me, x, y, reach, out)
 
-    # ---- 6. Loot / 7. Hold ----
+    # ---- 6. Farm / 7. Explore ----
     else:
-        target = None
-        quiet = t - memory.get("last_enemy_t", -99) > 4.0
-        if quiet and nearest_enemy > LOOT_SAFE_RANGE:
-            target, mode, take = _pick_loot(obs, me, x, y, reach)
-            if take is not None:
-                out["take"] = take
-        if target is not None:
-            goal, speed = target[:2], 1.0
-            if mode == "supply-drop" and _dist2d(goal, (x, y)) < 3.0:
-                speed = 0.0  # stand inside the ring until captured
-        elif far_from_next:
-            goal, speed, mode = (ncx, ncy), 1.0, "travel"
-        else:
-            spot = _hold_spot(gmap, memory, x, y, ncx, ncy, next_r)
-            goal, face = spot[:2], spot[2]
+        f = _pick_farm(obs, me, x, y, reach, hp_frac, zone, memory)
+        if f is not None:
+            goal, mode, stand = f["goal"], f["mode"], f.get("stand", 0.0)
+            if f.get("take") is not None:
+                out["take"] = f["take"]
+                if f.get("drop") is not None:
+                    out["drop"] = f["drop"]
+            memory["farm_target"] = f.get("target")
             d = _dist2d(goal, (x, y))
-            speed, mode = (0.8 if d > 30 else (0.35 if d > 2.5 else 0.0)), "hold"
+            if stand > 0:
+                # shooting a drone/crate: hold this distance and sidestep a little
+                if d < stand * 0.8:
+                    bx, by = _unit(x - goal[0], y - goal[1])
+                    dx, dy, goal = bx, by, None
+                elif d < stand * 1.2:
+                    bx, by = _unit(goal[0] - x, goal[1] - y)
+                    side = 1 if int(t / 1.2) % 2 == 0 else -1
+                    dx, dy, goal = -by * side, bx * side, None
+                    speed = 0.6
+            elif d < 1.5:
+                speed = 0.0
+        else:
+            goal = _explore_point(memory, x, y, ncx, ncy, next_r)
+            mode = "explore"
 
     if goal is not None:
         dx, dy = _unit(goal[0] - x, goal[1] - y)
         if gmap is not None and _dist2d(goal, (x, y)) > 6:
-            dx, dy = _steer(gmap, x, y, dx, dy)
+            dx, dy = _route(gmap, memory, t, x, y, goal, dx, dy)
 
-    # ---- avoid NPC drones (except when the zone forces us) ----
-    if mode not in ("zone", "dodge"):
-        for n in npcs:
-            d = _dist2d(n["pos"], (x, y))
-            if d < NPC_AVOID:
-                px, py = _unit(x - n["pos"][0], y - n["pos"][1])
-                w = (NPC_AVOID - d) / NPC_AVOID * 1.5
-                dx, dy = _unit(dx + px * w, dy + py * w)
-                speed = max(speed, 0.8)
-
-    # ---- stuck detection ----
+    # ---- stuck detection: we asked to move a lot but barely moved ----
     hist = memory.setdefault("pos_hist", [])
-    hist.append((x, y))
-    if len(hist) > 10:
+    hist.append((x, y, math.hypot(dx, dy) * speed))
+    if len(hist) > 12:
         hist.pop(0)
     jump = False
     if t < memory.get("unstick_until", -1):
         dx, dy = _rotate(dx, dy, memory["unstick_ang"])
         speed, jump, boost = 1.0, me["grounded"], energy > 15
         mode += "+unstick"
-    elif speed > 0.3 and len(hist) == 10 and _dist2d(hist[0], hist[-1]) < 1.5:
-        memory["unstick_until"] = t + 1.2
-        memory["unstick_ang"] = random.choice([math.pi / 2, -math.pi / 2, math.pi * 0.75])
-        memory.pop("hold_pt", None)
-        hist.clear()
+    elif len(hist) == 12:
+        wanted = sum(h[2] for h in hist[:-1]) * me.get("stats", {}).get("walk_speed", 11.7) * 0.1
+        moved = _dist2d(hist[0], hist[-1])
+        if wanted > 6.0 and moved < wanted * 0.2 and mode not in ("fight", "hunt-drone", "crate", "dodge"):
+            memory["unstick_until"] = t + 1.0
+            memory["unstick_ang"] = random.choice([math.pi / 2, -math.pi / 2, math.pi * 0.75])
+            memory["stuck_count"] = memory.get("stuck_count", 0) + 1
+            if memory["stuck_count"] >= 3:  # same target keeps blocking us: skip it for a while
+                memory.setdefault("bad_targets", {})[memory.get("last_goal_key")] = t
+                memory.pop("explore_pt", None)
+                memory.pop("cover_pt", None)
+                memory["stuck_count"] = 0
+            hist.clear()
+    if memory.get("last_goal_key") != ((round(goal[0]), round(goal[1])) if goal is not None else None):
+        memory["stuck_count"] = 0
+    memory["last_goal_key"] = (round(goal[0]), round(goal[1])) if goal is not None else None
 
     if speed == 0.0 and face is not None:
         memory["move_yaw"] = face
@@ -212,17 +219,121 @@ def decide_move(obs, memory):
     return out
 
 
-# ---------------- helpers ----------------
+# ---------------- farming ----------------
 
-def _dodge_dir(obs, me, x, y, z):
-    """Direction to sidestep if something is about to hit us, else None."""
-    cz = z + 4.5  # our center of mass
+def _bad(memory_bad, pos, t):
+    when = memory_bad.get((round(pos[0]), round(pos[1])))
+    return when is not None and t - when < 20
+
+
+def _pick_farm(obs, me, x, y, reach, hp_frac, zone, memory):
+    """Best thing to farm right now, or None."""
+    t = obs["t"]
+    mem_bad = memory.get("bad_targets", {})
+    ccx, ccy = zone["center"]
+    safe_r = zone["radius"] - 20
+
+    def ok(pos, max_dz):
+        return (abs(pos[2] - me["pos"][2]) <= max_dz and _dist2d(pos, (ccx, ccy)) < safe_r
+                and not _bad(mem_bad, pos, t))
+
+    weapons = me["weapons"]
+    held = {w["kind"] for w in weapons if w}
+    slot1 = weapons[1] if len(weapons) > 1 else None
+
+    # 1) weapons: fill the empty slot, or swap a mortar for lightning/laser
+    best, best_score = None, -1e9
+    for p in obs.get("pickups", []):
+        k = p["kind"]
+        if k in held or k not in WEAPON_PREF or not ok(p["pos"], 12):
+            continue
+        if slot1 is not None and not (slot1["kind"] == "mortar" and WEAPON_PREF[k] > 1):
+            continue
+        d = _dist2d(p["pos"], (x, y))
+        if d > WEAPON_RANGE:
+            continue
+        score = WEAPON_PREF[k] * 60 - d
+        if score > best_score:
+            best, best_score = p, score
+    if best is not None:
+        d = _dist2d(best["pos"], (x, y))
+        res = {"goal": best["pos"][:2], "mode": "get-" + best["kind"]}
+        if d < reach * 0.9 and abs(best["pos"][2] - me["pos"][2]) < 4:
+            res["take"] = best["id"]
+            if slot1 is not None:
+                if slot1.get("charge", 0) == 0:
+                    res["drop"] = 1
+                else:
+                    res.pop("take")
+        return res
+
+    # 2) cubes
+    cubes = [c for c in obs.get("cubes", []) if ok(c["pos"], 10) and _dist2d(c["pos"], (x, y)) < CUBE_RANGE]
+    if cubes:
+        c = min(cubes, key=lambda c: _dist2d(c["pos"], (x, y)))
+        return {"goal": c["pos"][:2], "mode": "cube"}
+
+    # 3) supply drop (full HP + 3 cubes) if we can get there around landing time
+    for dr in obs.get("drops", []):
+        d = _dist2d(dr["pos"], (x, y))
+        if d < 220 and dr.get("lands_in", 99) <= d / 11.0 + 4 and dr.get("holder") in (None, me["id"]):
+            return {"goal": dr["pos"][:2], "mode": "supply-drop"}
+
+    # 4) NPC drones (350 HP, 2 cubes each) - only when healthy
+    if hp_frac > 0.6:
+        npcs = [n for n in obs["mechs"] if n["kind"] == "npc" and ok(n["pos"], 15)
+                and _dist2d(n["pos"], (x, y)) < NPC_RANGE]
+        if npcs:
+            n = min(npcs, key=lambda n: _dist2d(n["pos"], (x, y)) + n.get("hp", 350) * 0.05)
+            return {"goal": n["pos"][:2], "mode": "hunt-drone", "target": n["id"], "stand": NPC_SHOOT_DIST}
+
+    # 5) crates (1 cube, 50% weapon)
+    crates = [c for c in obs.get("crates", []) if ok(c["pos"], 6) and _dist2d(c["pos"], (x, y)) < CRATE_RANGE]
+    if crates:
+        c = min(crates, key=lambda c: _dist2d(c["pos"], (x, y)))
+        return {"goal": c["pos"][:2], "mode": "crate", "target": c["id"], "stand": CRATE_SHOOT_DIST}
+    return None
+
+
+def _grab_adjacent(obs, me, x, y, reach, out):
+    """Mid-fight: take a better weapon if we're standing on it."""
+    weapons = me["weapons"]
+    held = {w["kind"] for w in weapons if w}
+    slot1 = weapons[1] if len(weapons) > 1 else None
+    for p in obs.get("pickups", []):
+        if p["kind"] in held or p["kind"] not in WEAPON_PREF:
+            continue
+        if _dist2d(p["pos"], (x, y)) < reach * 0.9 and abs(p["pos"][2] - me["pos"][2]) < 4:
+            if slot1 is None:
+                out["take"] = p["id"]
+            elif slot1["kind"] == "mortar" and WEAPON_PREF[p["kind"]] > 1 and slot1.get("charge", 0) == 0:
+                out["take"], out["drop"] = p["id"], 1
+            return
+
+
+def _explore_point(memory, x, y, ncx, ncy, next_r):
+    pt = memory.get("explore_pt")
+    if pt is None or _dist2d(pt, (x, y)) < 8 or _dist2d(pt, (ncx, ncy)) > next_r * 0.75:
+        for _ in range(10):
+            ang = random.uniform(-math.pi, math.pi)
+            rad = random.uniform(0, next_r * 0.65)
+            cand = (ncx + rad * math.cos(ang), ncy + rad * math.sin(ang))
+            if _dist2d(cand, (x, y)) > 50 or next_r < 80:
+                break
+        pt = cand
+        memory["explore_pt"] = pt
+    return pt
+
+
+# ---------------- safety helpers ----------------
+
+def _dodge_dir(obs, x, y, z):
+    cz = z + 4.5
     best = None
     for p in obs.get("projectiles", []):
         px, py, pz = p["pos"]
         vx, vy, vz = p["vel"]
         if p["kind"] == "mortar":
-            # where will the shell come down (roughly at our height)?
             g = 22.0
             a, b, c = -0.5 * g, vz, pz - z
             disc = b * b - 4 * a * c
@@ -233,25 +344,25 @@ def _dodge_dir(obs, me, x, y, z):
                 continue
             lx, ly = px + vx * tt, py + vy * tt
             if math.hypot(lx - x, ly - y) < 10:
-                return _unit(x - lx, y - ly)  # run away from the landing point
+                return _unit(x - lx, y - ly)
             continue
+        if p["kind"] == "npc":
+            continue  # slow & weak, not worth breaking our plan
         rx, ry, rz = x - px, y - py, cz - pz
         v2 = vx * vx + vy * vy + vz * vz
         if v2 < 1:
             continue
-        tca = (rx * vx + ry * vy + rz * vz) / v2  # time of closest approach
-        if not 0 < tca < 0.6:
+        tca = (rx * vx + ry * vy + rz * vz) / v2
+        if not 0 < tca < 0.5:
             continue
         mx, my = px + vx * tca - x, py + vy * tca - y
-        if math.hypot(mx, my) < 4.0:
-            # step sideways, away from where it will pass
+        if math.hypot(mx, my) < 3.5:
             sx, sy = _unit(-vy, vx)
             if sx * mx + sy * my > 0:
                 sx, sy = -sx, -sy
             best = (sx, sy)
     if best is not None:
         return best
-    # a laser charging and pointed at us
     for m in obs["mechs"]:
         if m["kind"] == "mech" and m.get("charging"):
             bearing_to_me = math.atan2(y - m["pos"][1], x - m["pos"][0])
@@ -262,8 +373,45 @@ def _dodge_dir(obs, me, x, y, z):
     return None
 
 
+def _route(gmap, memory, t, x, y, goal, dx, dy):
+    """Go straight if the way is clear; otherwise follow an A* route around the buildings."""
+    if not gmap.blocked((x, y), goal, step=3.0, walk=True):
+        memory.pop("path", None)
+        return dx, dy
+    nav = getattr(gmap, "nav", None)
+    if nav is None:
+        return _steer(gmap, x, y, dx, dy)
+    p = memory.get("path")
+    need = (p is None or _dist2d(p["goal"], goal) > 8 or t - p["t"] > 4.0
+            or min((_dist2d(w, (x, y)) for w in p["pts"][p["i"]:p["i"] + 6]), default=99) > 12)
+    if need and p is not None and t - p["t"] < 0.5:
+        need = False  # plan at most twice a second (keeps every reply fast)
+    if need and t - memory.get("path_fail_t", -99) < 1.5:
+        return _steer(gmap, x, y, dx, dy)  # just failed to find a route: don't retry every tick
+    if need:
+        pts = nav.path((x, y), goal, max_expand=4000)
+        if pts is None:
+            memory.pop("path", None)
+            memory["path_fail_t"] = t
+            return _steer(gmap, x, y, dx, dy)
+        p = {"goal": goal, "pts": pts, "i": 0, "t": t}
+        memory["path"] = p
+    pts = p["pts"]
+    # move our index forward to the closest upcoming waypoint
+    i = p["i"]
+    while i + 1 < len(pts) and _dist2d(pts[i + 1], (x, y)) <= _dist2d(pts[i], (x, y)):
+        i += 1
+    p["i"] = i
+    # aim for the furthest waypoint (within ~28 m) we can walk to in a straight line
+    target = pts[min(i + 1, len(pts) - 1)]
+    for k in range(min(i + 7, len(pts) - 1), i, -1):
+        if _dist2d(pts[k], (x, y)) < 28 and not gmap.blocked((x, y), pts[k], step=3.0, walk=True):
+            target = pts[k]
+            break
+    return _unit(target[0] - x, target[1] - y)
+
+
 def _steer(gmap, x, y, dx, dy, probe=15.0):
-    """If any wall (even a short one) is straight ahead, turn left/right until the way is clear."""
     if not gmap.blocked((x, y), (x + dx * probe, y + dy * probe), step=4.0, walk=True):
         return dx, dy
     for deg in (25, -25, 50, -50, 75, -75, 100, -100, 130, -130):
@@ -273,34 +421,18 @@ def _steer(gmap, x, y, dx, dy, probe=15.0):
     return dx, dy
 
 
-def _hold_spot(gmap, memory, x, y, ncx, ncy, next_r, near_only=False):
-    """Parking spot inside the next circle, next to a wall when we have the map."""
-    spot = memory.get("hold_pt")
-    limit = next_r * HOLD_FRACTION
-    if spot is not None and _dist2d(spot, (ncx, ncy)) <= limit and (not near_only or _dist2d(spot, (x, y)) < 60):
+def _cover_near_me(gmap, memory, x, y):
+    spot = memory.get("cover_pt")
+    if spot is not None and _dist2d(spot, (x, y)) < 60:
         return spot
     spot = None
     if gmap is not None:
-        best = 1e9
-        centers = ((x, y),) if near_only else ((x, y), (ncx, ncy))
-        for cx, cy in centers:
-            for d, p in gmap.cover_near(cx, cy, 60.0 if near_only else 150.0)[:400]:
-                dc = _dist2d(p, (ncx, ncy))
-                if dc > limit and not near_only:
-                    continue
-                score = _dist2d(p, (x, y)) + 0.3 * dc
-                if score < best:
-                    best, spot = score, p
-            if spot is not None:
-                break
+        near = gmap.cover_near(x, y, 60.0)
+        if near:
+            spot = near[0][1]
     if spot is None:
-        if near_only:
-            spot = (x, y, memory.get("move_yaw", 0.0))
-        else:
-            ang = random.uniform(-math.pi, math.pi)
-            rad = random.uniform(0, next_r * 0.35)
-            spot = (ncx + rad * math.cos(ang), ncy + rad * math.sin(ang), math.atan2(ncy - y, ncx - x))
-    memory["hold_pt"] = spot
+        spot = (x, y, memory.get("move_yaw", 0.0))
+    memory["cover_pt"] = spot
     return spot
 
 
@@ -325,43 +457,5 @@ def _retreat_spot(gmap, memory, t, x, y, threat, zone):
             break
     memory["retreat"] = (t, best)
     if best is not None:
-        memory["hold_pt"] = best  # recover right there afterwards
+        memory["cover_pt"] = best
     return best
-
-
-def _pick_loot(obs, me, x, y, reach):
-    held = {w["kind"] for w in me["weapons"] if w}
-    slot1_empty = me["weapons"][1] is None if len(me["weapons"]) > 1 else False
-
-    if slot1_empty:
-        best, best_score = None, -1
-        for p in obs.get("pickups", []):
-            if p["kind"] in held or p["kind"] not in WEAPON_PREF:
-                continue
-            d = _dist2d(p["pos"], (x, y))
-            if d > PICKUP_RANGE or abs(p["pos"][2] - me["pos"][2]) > 15:
-                continue
-            score = WEAPON_PREF[p["kind"]] * 100 - d
-            if score > best_score:
-                best, best_score = p, score
-        if best is not None:
-            d = _dist2d(best["pos"], (x, y))
-            take = best["id"] if d < reach and abs(best["pos"][2] - me["pos"][2]) < 4 else None
-            return best["pos"], "loot-weapon", take
-
-    cubes = sorted(obs.get("cubes", []), key=lambda c: _dist2d(c["pos"], (x, y)))
-    if cubes and _dist2d(cubes[0]["pos"], (x, y)) < CUBE_RANGE and abs(cubes[0]["pos"][2] - me["pos"][2]) < 15:
-        return cubes[0]["pos"], "loot-cube", None
-
-    for dr in obs.get("drops", []):
-        d = _dist2d(dr["pos"], (x, y))
-        arrive = d / 11.0  # seconds to walk there
-        if d < 220 and dr.get("lands_in", 99) <= arrive + 4 and dr.get("holder") in (None, me["id"]):
-            return dr["pos"], "supply-drop", None
-
-    # crates: walk up to nearby ones so combat can break them for cubes/weapons
-    crates = sorted(obs.get("crates", []), key=lambda c: _dist2d(c["pos"], (x, y)))
-    if crates and 12 < _dist2d(crates[0]["pos"], (x, y)) < 60 and abs(crates[0]["pos"][2] - me["pos"][2]) < 6:
-        return crates[0]["pos"], "loot-crate", None
-
-    return None, "hold", None

@@ -45,11 +45,15 @@ class MapData:
         self.wall_grid = {}
         self.cover = []       # (x, y, face_yaw)
         self.cover_grid = {}  # (cx, cy) -> [cover index]
+        self.nav = None
         try:
             with open(os.path.join(map_dir, "v2", "world.json")) as f:
                 world = json.load(f)
             self._load(world)
             self.ok = len(self.prisms) > 0
+            self.nav = None
+            if self.ok and "bounds" in world:
+                self.nav = Nav(self, world["bounds"])
         except Exception as e:  # missing file, bad format... -> run without the map
             import sys
             print(f"mapdata: could not load map: {e!r}", file=sys.stderr, flush=True)
@@ -145,3 +149,106 @@ class MapData:
                         out.append((d, p))
         out.sort(key=lambda t: t[0])
         return out
+
+
+# ---------------- pathfinding (GPS-style routes around buildings) ----------------
+import heapq
+
+NAV_CELL = 4.0  # meters per grid square
+
+
+class Nav:
+    """A walkability grid over the whole map + A* search. Built once at match start."""
+
+    def __init__(self, gmap, bounds):
+        self.g = gmap
+        self.minx, self.miny = bounds["minX"], bounds["minY"]
+        self.nx = int((bounds["maxX"] - self.minx) // NAV_CELL) + 1
+        self.ny = int((bounds["maxY"] - self.miny) // NAV_CELL) + 1
+        blocked = bytearray(self.nx * self.ny)
+        for j in range(self.ny):
+            cy = self.miny + (j + 0.5) * NAV_CELL
+            for i in range(self.nx):
+                if gmap.in_building(self.minx + (i + 0.5) * NAV_CELL, cy, walk=True):
+                    blocked[j * self.nx + i] = 1
+        # grow walls by one square so the 2.5 m-wide mech doesn't scrape corners
+        grown = bytearray(blocked)
+        for j in range(self.ny):
+            for i in range(self.nx):
+                if blocked[j * self.nx + i]:
+                    for dj in (-1, 0, 1):
+                        for di in (-1, 0, 1):
+                            ii, jj = i + di, j + dj
+                            if 0 <= ii < self.nx and 0 <= jj < self.ny:
+                                grown[jj * self.nx + ii] = 2 if not blocked[jj * self.nx + ii] else 1
+        self.raw = blocked
+        self.grid = grown  # 0 free, 2 near a wall (allowed but costly), 1 wall
+
+    def cell(self, x, y):
+        i = int((x - self.minx) // NAV_CELL)
+        j = int((y - self.miny) // NAV_CELL)
+        return min(max(i, 0), self.nx - 1), min(max(j, 0), self.ny - 1)
+
+    def center(self, i, j):
+        return (self.minx + (i + 0.5) * NAV_CELL, self.miny + (j + 0.5) * NAV_CELL)
+
+    def _free_near(self, i, j):
+        if self.grid[j * self.nx + i] != 1:
+            return i, j
+        for r in range(1, 6):
+            for dj in range(-r, r + 1):
+                for di in range(-r, r + 1):
+                    ii, jj = i + di, j + dj
+                    if 0 <= ii < self.nx and 0 <= jj < self.ny and self.grid[jj * self.nx + ii] != 1:
+                        return ii, jj
+        return None
+
+    def path(self, a, b, max_expand=6000):
+        """List of waypoints from a to b, or None if not found within the budget."""
+        s = self._free_near(*self.cell(a[0], a[1]))
+        e = self._free_near(*self.cell(b[0], b[1]))
+        if s is None or e is None:
+            return None
+        nx, grid = self.nx, self.grid
+        start, goal = s[1] * nx + s[0], e[1] * nx + e[0]
+        gx, gy = e
+        came = {start: -1}
+        cost = {start: 0.0}
+        heap = [(0.0, start)]
+        steps = ((1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0),
+                 (1, 1, 1.414), (1, -1, 1.414), (-1, 1, 1.414), (-1, -1, 1.414))
+        expanded = 0
+        while heap:
+            _, cur = heapq.heappop(heap)
+            if cur == goal:
+                break
+            expanded += 1
+            if expanded > max_expand:
+                return None
+            ci, cj = cur % nx, cur // nx
+            base = cost[cur]
+            for di, dj, w in steps:
+                ii, jj = ci + di, cj + dj
+                if not (0 <= ii < nx and 0 <= jj < self.ny):
+                    continue
+                k = jj * nx + ii
+                v = grid[k]
+                if v == 1:
+                    continue
+                if di and dj and (grid[cj * nx + ii] == 1 or grid[jj * nx + ci] == 1):
+                    continue  # don't cut wall corners diagonally
+                nc = base + w * (1.6 if v == 2 else 1.0)
+                if nc < cost.get(k, 1e18):
+                    cost[k] = nc
+                    came[k] = cur
+                    h = math.hypot(ii - gx, jj - gy)
+                    heapq.heappush(heap, (nc + 1.3 * h, k))
+        if goal not in came:
+            return None
+        cells = []
+        k = goal
+        while k != -1:
+            cells.append(self.center(k % nx, k // nx))
+            k = came[k]
+        cells.reverse()
+        return cells

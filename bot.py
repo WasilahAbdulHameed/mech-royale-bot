@@ -1,4 +1,4 @@
-"""Main bot (v4): joins movement (where to go) and combat (what to shoot) into one action.
+"""Main bot (v5, farm then fight): joins movement (where to go) and combat (what to shoot) into one action.
 
 Owner: Wasilah (integration). movement.py = Wasilah, combat.py = teammate.
 """
@@ -12,9 +12,9 @@ import movement
 
 # Upgrade preference: survival first. Words are matched against the upgrade's id/name/desc.
 UPGRADE_WORDS = [
-    ("armor", 10), ("damage taken", 10), ("regen", 8), ("hp", 8), ("health", 8),
-    ("fire rate", 6), ("damage", 6), ("reload", 5), ("sensor", 4), ("vision", 4),
-    ("speed", 3), ("energy", 3),
+    ("armor", 10), ("damage taken", 10), ("fire rate", 9), ("rate", 6), ("damage", 8),
+    ("hp", 8), ("health", 8), ("regen", 7), ("reload", 6), ("lightning", 5), ("cooldown", 5),
+    ("sensor", 3), ("vision", 3), ("speed", 3), ("energy", 3),
 ]
 
 
@@ -34,7 +34,7 @@ def pick_upgrade(offer):
 
 
 class Bot:
-    name = "glitch-v4"
+    name = "glitch-v5"
 
     def __init__(self, hello):
         cfg = hello["config"]
