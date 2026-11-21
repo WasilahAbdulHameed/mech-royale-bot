@@ -92,6 +92,18 @@ def decide_combat(obs, memory):
         if score < best_score:
             target, kind, best_score = enemy, "mech", score
 
+    # Experiment: a non-attacking mech hidden behind a building cannot be
+    # hit by our direct-fire weapons. Allow farming to continue instead of
+    # staring at the blocked enemy. Keep recent attackers as priorities.
+    if target is not None and str(target["id"]) not in attackers:
+        gmap = memory.get("map")
+        if gmap is not None and getattr(gmap, "ok", False):
+            try:
+                if gmap.blocked(pos[:2], target["pos"][:2], step=5.0):
+                    target, kind = None, None
+            except (AttributeError, TypeError, ValueError):
+                pass
+
     # 2. Farm the NPC or crate selected by movement.py, if still visible.
     # IDs can be integers or strings; normalize to avoid a mismatch.
     if target is None:
@@ -205,5 +217,3 @@ def decide_combat(obs, memory):
             out["fire"][1] = True
 
     return out
-
-    
