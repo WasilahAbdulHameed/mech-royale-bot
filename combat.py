@@ -217,3 +217,4 @@ def decide_combat(obs, memory):
             out["fire"][1] = True
 
     return out
+
