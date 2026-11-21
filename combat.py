@@ -1,15 +1,29 @@
-"""Mech Royale v7 combat: improved gun leading and disciplined laser timing.
+"""Combat v7 merged (owner: teammate) = v6 combat + the teammate's v7 improvements:
+- gun checks its OWN lead aim when lightning/laser is steering the torso
+- laser: release once lined up, never hold so long it auto-fires; no new charge while escaping
+- ids compared as strings for farm_target
+(v6's 150 m engage range and aim tolerance are kept - v7's tighter values scored lower.)
 
-Only returns aim, fire, reload.
+Earlier notes: Combat v6 = v5 combat + the best ideas from the teammate's version.
+Keep decide_combat(obs, memory) and return only aim/fire/reload.
 
-Compatible with bot.py merging combat actions into movement actions.
-Movement/retreat must be handled by movement.py; this module does not move.
+From the teammate's version: don't START new fights when we're badly hurt (but always fight
+back and always finish off a nearly-dead enemy), cap how far ahead we lead a target,
+keep an energy reserve for lightning, and top up the gun early when idle.
+
+Priorities:
+  1. Enemy mechs (kills = points). Prefer weak ones, ones shooting us, ones showing their back.
+  2. Whatever movement.py is farming (memory["farm_target"]): an NPC drone or a crate.
+  3. NPC drones that are shooting us.
+Then: lead moving targets with the gun, laser = charge and release when lined up,
+lightning whenever something is inside its cone, mortar over walls / at slow targets.
+With nothing to shoot: face whoever hit us, otherwise sweep the view to spot loot and enemies.
 """
 import math
 
-ENGAGE_RANGE = 80.0       # avoid provoking distant mechs
-THREAT_RANGE = 180.0      # defend against recent attackers farther away
-CRATE_RANGE = 45.0
+ENGAGE_RANGE = 150.0     # start fights with enemy mechs closer than this (gun range is 230)
+LOW_HP_NO_NEW_FIGHTS = 0.45  # below this, only fight back / finish kills
+FINISH_HP = 0.2          # an enemy below this fraction is always worth finishing (if < 70 m)
 
 
 def _d3(a, b):
@@ -25,202 +39,172 @@ def _angdiff(a, b):
 
 
 def _aim_at(src, dst):
-    return (math.atan2(dst[1] - src[1], dst[0] - src[0]),
-            math.atan2(dst[2] - src[2], _d2(src, dst)))
+    return math.atan2(dst[1] - src[1], dst[0] - src[0]), math.atan2(dst[2] - src[2], _d2(src, dst))
 
 
 def _lead(src, tpos, tvel, speed):
     p = list(tpos)
     for _ in range(3):
-        seconds = min(1.5, _d3(src, p) / max(speed, 1.0))
-        p = [tpos[i] + tvel[i] * seconds for i in range(3)]
+        tt = min(1.5, _d3(src, p) / max(speed, 1.0))  # don't guess too far ahead
+        p = [tpos[0] + tvel[0] * tt, tpos[1] + tvel[1] * tt, tpos[2] + tvel[2] * tt]
     return p
 
 
-def _mortar_pitch(distance, dz, speed, gravity):
-    speed2 = speed * speed
-    disc = speed2 * speed2 - gravity * (gravity * distance * distance + 2 * dz * speed2)
-    if disc < 0 or distance < 1 or gravity <= 0:
+def _mortar_pitch(dist, dz, v, g, high=False):
+    v2 = v * v
+    disc = v2 * v2 - g * (g * dist * dist + 2 * dz * v2)
+    if disc < 0 or dist < 1:
         return None
-    return math.atan((speed2 - math.sqrt(disc)) / (gravity * distance))
+    root = math.sqrt(disc)
+    return math.atan((v2 + root) / (g * dist)) if high else math.atan((v2 - root) / (g * dist))
 
 
 def decide_combat(obs, memory):
     me = obs["self"]
     pos = me["pos"]
-    now = obs["t"]
+    t = obs["t"]
     stats = me.get("stats", {})
     muzzle = [pos[0], pos[1], pos[2] + stats.get("muzzle_height", 7.0)]
-    weapons = me.get("weapons", [])
-    gun = weapons[0] if len(weapons) > 0 else None
-    special = weapons[1] if len(weapons) > 1 else None
+    weapons = me["weapons"]
+    w0 = weapons[0] if len(weapons) > 0 else None
+    w1 = weapons[1] if len(weapons) > 1 else None
+    gmap = memory.get("map")
+    if gmap is not None and not gmap.ok:
+        gmap = None
     out = {"fire": [False, False]}
-    health_ratio = me.get("hp", 1400) / max(1, me.get("max_hp", 1400))
 
-    # Record recent attackers, and face the direction shots came from.
-    attackers = memory.setdefault("combat_attackers", {})
+    att = memory.setdefault("attackers", {})
     for ev in obs.get("events", []):
-        if ev.get("type") == "damaged":
-            if ev.get("bearing") is not None:
-                memory["combat_hit_bearing"] = ev["bearing"]
-                memory["combat_hit_time"] = now
-            if ev.get("by") is not None:
-                attackers[str(ev["by"])] = now
-    for enemy_id, when in list(attackers.items()):
-        if now - when > 6.0:
-            del attackers[enemy_id]
+        if ev.get("type") == "damaged" and ev.get("by") is not None:
+            att[ev["by"]] = t
+    attackers = {k for k, when in att.items() if t - when < 5}
 
-    # 1. Enemy mechs always have priority over farming targets.
-    target = None
-    kind = None
-    best_score = float("inf")
-    for enemy in obs.get("mechs", []):
-        if enemy.get("kind") != "mech":
+    def wall_between(p):
+        return gmap is not None and gmap.blocked(pos, p, step=4.0)
+
+    my_hp = me["hp"] / max(1.0, me["max_hp"])
+
+    # ---- 1. enemy mechs ----
+    target, tkind, best, t_blocked = None, None, 1e9, False
+    for m in obs["mechs"]:
+        if m["kind"] != "mech":
             continue
-        distance = _d3(pos, enemy["pos"])
-        is_attacker = str(enemy["id"]) in attackers
-        hp_ratio = enemy.get("hp", 1400) / max(1, enemy.get("max_hp", 1400))
-        can_finish = hp_ratio < 0.18 and distance < 65
-        if is_attacker:
-            if distance > THREAT_RANGE:
+        d = _d3(pos, m["pos"])
+        hp_frac = m.get("hp", 1000) / max(1.0, m.get("max_hp", 1400))
+        is_att = m["id"] in attackers
+        can_finish = hp_frac < FINISH_HP and d < 70
+        if not is_att and not can_finish:
+            if d > ENGAGE_RANGE or my_hp < LOW_HP_NO_NEW_FIGHTS:
                 continue
-        elif (health_ratio < 0.45 and not can_finish) or distance > ENGAGE_RANGE:
-            continue
-        score = distance + 50 * hp_ratio - (85 if is_attacker else 0)
-        if can_finish:
-            score -= 30
-        if score < best_score:
-            target, kind, best_score = enemy, "mech", score
+        back = _angdiff(m["aim"][0], math.atan2(pos[1] - m["pos"][1], pos[0] - m["pos"][0])) > math.pi / 2
+        score = d + hp_frac * 120 - (40 if is_att else 0) - (30 if back else 0) - (40 if can_finish else 0)
+        blocked = wall_between(m["pos"])
+        if blocked:
+            score += 150
+        if score < best:
+            target, tkind, best, t_blocked = m, "mech", score, blocked
 
-    # 2. Farm the NPC or crate selected by movement.py, if still visible.
-    # IDs can be integers or strings; normalize to avoid a mismatch.
+    # ---- 2. farm target / 3. drones shooting us ----
     if target is None:
-        farm_id = memory.get("farm_target")
-        if farm_id is not None:
-            for npc in obs.get("mechs", []):
-                if npc.get("kind") == "npc" and str(npc.get("id")) == str(farm_id):
-                    target, kind = npc, "npc"
+        fid = memory.get("farm_target")
+        for n in obs["mechs"]:
+            if n["kind"] == "npc" and ((fid is not None and str(n["id"]) == str(fid)) or n["id"] in attackers):
+                if not wall_between(n["pos"]):
+                    target, tkind = n, "npc"
                     break
-            if target is None:
-                for crate in obs.get("crates", []):
-                    if str(crate.get("id")) == str(farm_id):
-                        target, kind = crate, "crate"
-                        break
+        if target is None and fid is not None:
+            for c in obs.get("crates", []):
+                if str(c["id"]) == str(fid) and not wall_between(c["pos"]):
+                    target, tkind = {"pos": c["pos"], "vel": [0, 0, 0], "id": c["id"]}, "crate"
+                    break
 
-    # 3. If not farming, defend against an NPC that recently damaged us.
-    if target is None:
-        nearby_attackers = [npc for npc in obs.get("mechs", [])
-                            if npc.get("kind") == "npc"
-                            and str(npc.get("id")) in attackers
-                            and _d3(pos, npc["pos"]) <= 65]
-        if nearby_attackers:
-            target = min(nearby_attackers, key=lambda npc: _d3(pos, npc["pos"]))
-            kind = "npc"
+    gun_ok = w0 is not None and w0["kind"] == "gun"
+    if gun_ok and w0.get("ammo", 1) == 0 and w0.get("reload", 0) == 0:
+        out["reload"] = True
 
+    # ---- nothing to shoot: look around ----
     if target is None:
-        # Taking damage from behind is especially costly; protect front armor.
-        if now - memory.get("combat_hit_time", -1e9) < 4:
-            out["aim"] = [memory["combat_hit_bearing"], 0.0]
-        elif "move_yaw" in memory:
-            out["aim"] = [memory["move_yaw"], 0.0]
-        if (gun and gun.get("kind") == "gun" and gun.get("reload", 0) <= 0
-                and gun.get("ammo", 99) < gun.get("stats", {}).get("mag", 12) * 0.75):
+        if t - memory.get("hit_t", -99) < 3.0:
+            out["aim"] = [memory["hit_bearing"], 0.0]
+        else:
+            base = memory.get("move_yaw", 0.0)
+            # sweep +-70 degrees around where we're going/facing to spot loot and enemies
+            out["aim"] = [base + 1.2 * math.sin(t * 1.6), 0.0]
+        if gun_ok and w0.get("ammo", 99) < w0["stats"].get("mag", 12) * 0.75 and w0.get("reload", 0) == 0:
             out["reload"] = True
         return out
 
-    height = 4.5 if kind == "mech" else (1.75 if kind == "npc" else 0.5)
-    target_pos = [target["pos"][0], target["pos"][1], target["pos"][2] + height]
-    velocity = target.get("vel", [0, 0, 0])
-    distance = _d3(muzzle, target_pos)
-    current_yaw, current_pitch = me["aim"]
-    # A smaller tolerance at midrange avoids shots that miss a strafing mech.
-    tolerance = max(0.018, min(0.06, math.atan2(1.6, max(distance, 1.0))))
+    # ---- aim + fire ----
+    height = {"mech": 4.5, "npc": 1.75}.get(tkind, 0.5)
+    tpos = [target["pos"][0], target["pos"][1], target["pos"][2] + height]
+    tvel = target.get("vel", [0, 0, 0])
+    dist = _d3(muzzle, tpos)
+    cur_yaw, cur_pitch = me["aim"]
+    radius = {"mech": 2.5, "npc": 1.8}.get(tkind, 1.0)
+    tol = max(0.012, math.atan2(radius * 0.9, max(dist, 1.0)))
 
-    # Buildings block direct gun, laser and lightning shots. The map's blocked()
-    # method accepts horizontal (x, y) points, as used by movement.py.
-    # Mortars are indirect and can sometimes clear buildings, so do not
-    # suppress a mortar just because the ground-level line is blocked.
-    gmap = memory.get("map")
-    blocked = False
-    if gmap is not None and getattr(gmap, "ok", False):
-        try:
-            blocked = bool(gmap.blocked(pos[:2], target["pos"][:2], step=5.0))
-        except (AttributeError, TypeError, ValueError):
-            blocked = False
-
-    # Special weapon, if useful. Do not start a charge that slows our escape
-    # when health is low; existing charges are released below.
     plan = "gun"
-    if special:
-        name = special.get("kind")
-        s = special.get("stats", {})
-        if name == "lightning" and not blocked and distance < s.get("range", 45) - 3:
+    if w1:
+        k = w1["kind"]
+        if k == "lightning" and dist < w1["stats"].get("range", 45) - 2 and not t_blocked:
             plan = "lightning"
-        elif name == "laser" and not blocked and distance < s.get("range", 280):
-            if health_ratio > 0.5 or special.get("charge", 0) > 0:
-                plan = "laser"
-        elif name == "mortar" and 32 < distance < 190 and special.get("cooldown", 0) <= 0:
+        elif k == "laser" and dist < w1["stats"].get("range", 280) and not t_blocked and tkind != "crate":
+            plan = "laser"
+        elif (k == "mortar" and 25 < dist < 220 and w1.get("cooldown", 0) <= 0
+              and (t_blocked or _d2(tvel, (0, 0)) < 3)):
             plan = "mortar"
+    if t_blocked and plan != "mortar":
+        out["aim"] = list(_aim_at(muzzle, tpos))  # face them (front armor), hold fire
+        return out
 
     if plan == "mortar":
-        s = special.get("stats", {})
-        speed, gravity = s.get("speed", 72), s.get("gravity", 22)
-        tube = [pos[0], pos[1], pos[2] + stats.get("height", 9) + 0.5]
-        predicted = _lead(tube, target_pos, velocity, speed * 0.7)
-        pitch = _mortar_pitch(_d2(tube, predicted), predicted[2] - tube[2], speed, gravity)
-        if pitch is not None:
-            yaw = math.atan2(predicted[1] - tube[1], predicted[0] - tube[0])
+        st = w1["stats"]
+        v, g = st.get("speed", 72), st.get("gravity", 22)
+        tube = [pos[0], pos[1], pos[2] + stats.get("height", 9.0) + 0.5]
+        lp = _lead(tube, [tpos[0], tpos[1], target["pos"][2]], tvel, v * 0.7)
+        pitch = _mortar_pitch(_d2(tube, lp), lp[2] - tube[2], v, g, high=t_blocked)
+        if pitch is not None and pitch <= stats.get("max_pitch", 1.4):
+            yaw = math.atan2(lp[1] - tube[1], lp[0] - tube[0])
             out["aim"] = [yaw, pitch]
-            if _angdiff(current_yaw, yaw) < 0.04 and abs(current_pitch - pitch) < 0.035:
+            if _angdiff(cur_yaw, yaw) < 0.03 and abs(cur_pitch - pitch) < 0.02:
                 out["fire"][1] = True
+            return out
+        if t_blocked:
+            out["aim"] = list(_aim_at(muzzle, tpos))
             return out
         plan = "gun"
 
-    gun_speed = gun.get("stats", {}).get("speed", 252) if gun else 252
-    gun_predicted = _lead(muzzle, target_pos, velocity, gun_speed)
-    gun_yaw, gun_pitch = _aim_at(muzzle, gun_predicted)
-
-    # Hitscan laser and lightning use the current target position rather than
-    # the gun's projectile lead. Track their aim separately from gun aim.
-    direct_yaw, direct_pitch = _aim_at(muzzle, target_pos)
-    if plan == "gun":
-        yaw, pitch = gun_yaw, gun_pitch
-    else:
-        yaw, pitch = direct_yaw, direct_pitch
+    speed = w0["stats"].get("speed", 252) if gun_ok else 252
+    gun_pt = _lead(muzzle, tpos, tvel, speed)
+    gun_yaw, gun_pitch = _aim_at(muzzle, gun_pt)
+    direct_yaw, direct_pitch = _aim_at(muzzle, tpos)   # laser & lightning are instant: no lead
+    yaw, pitch = (gun_yaw, gun_pitch) if plan == "gun" else (direct_yaw, direct_pitch)
     out["aim"] = [yaw, pitch]
-    aligned = (_angdiff(current_yaw, yaw) < tolerance
-               and abs(current_pitch - pitch) < tolerance * 1.5)
+    aligned = _angdiff(cur_yaw, yaw) < tol and abs(cur_pitch - pitch) < tol * 2
+    gun_aligned = _angdiff(cur_yaw, gun_yaw) < tol and abs(cur_pitch - gun_pitch) < tol * 2
 
-    if gun and gun.get("kind") == "gun":
-        if gun.get("ammo", 0) == 0 and gun.get("reload", 0) <= 0:
-            out["reload"] = True
-        # Gun must agree with actual aim, even while laser/lightning controls
-        # the torso. Previously it could fire while aimed at the wrong lead.
-        gun_aligned = (_angdiff(current_yaw, gun_yaw) < tolerance
-                       and abs(current_pitch - gun_pitch) < tolerance * 1.5)
-        if gun_aligned and not blocked and distance < gun.get("stats", {}).get("range", 230):
-            out["fire"][0] = True
+    charging = plan == "laser" and w1.get("charge", 0) > 0
+    if gun_ok and dist < w0["stats"].get("range", 230) and gun_aligned and w0.get("ammo", 1) > 0 and not charging:
+        out["fire"][0] = True
 
-    if special and plan == "lightning":
-        s = special.get("stats", {})
-        cone = math.radians(s.get("cone_deg", 30)) / 2
-        if (_angdiff(current_yaw, yaw) < cone * 0.8
-                and me.get("energy", 0) >= s.get("energy", 3) + 8):
+    if w1 and plan == "lightning":
+        cone = math.radians(w1["stats"].get("cone_deg", 30)) / 2
+        if _angdiff(cur_yaw, yaw) < cone * 0.85 and me["energy"] >= w1["stats"].get("energy", 3) + 6:
             out["fire"][1] = True
-    elif special and plan == "laser" and special.get("cooldown", 0) <= 0:
-        charge = special.get("charge", 0)
-        s = special.get("stats", {})
-        full = max(0.01, s.get("charge", 0.75))
-        hold_limit = full + s.get("hold_s", 2.0)
-        # Charging slows movement: do not begin a new charge while escaping,
-        # healing, or fighting with critically low HP.
-        escaping = memory.get("mode") in ("retreat", "recover", "zone", "dodge")
-        can_start = (not escaping and health_ratio > 0.5 and not blocked)
+    elif w1 and plan == "laser" and w1.get("cooldown", 0) <= 0:
+        charge = w1.get("charge", 0)
+        full = max(0.01, w1["stats"].get("charge", 0.75))
+        hold_limit = full + w1["stats"].get("hold_s", 2.0)
+        escaping = memory.get("mode") in ("retreat", "surrounded", "recover", "zone", "dodge")
         if charge > 0:
-            # Release only once aligned; don't hold so long that the laser
-            # auto-fires at an unwanted angle. The engine fires on release.
-            out["fire"][1] = not (aligned or charge >= hold_limit - 0.15) if charge >= full * 0.95 else True
-        elif can_start:
+            if charge >= full * 0.9:
+                # release (False) when lined up, or just before it would auto-fire
+                out["fire"][1] = not (aligned or charge >= hold_limit - 0.15)
+            else:
+                out["fire"][1] = True
+        elif not escaping and my_hp > 0.5:
             out["fire"][1] = True
 
     return out
+
+
