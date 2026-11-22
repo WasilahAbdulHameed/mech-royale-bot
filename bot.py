@@ -1,4 +1,4 @@
-"""Main bot (v8, farm, fight, endgame): joins movement (where to go) and combat (what to shoot) into one action.
+"""Main bot (v8b, farm, fight, endgame): joins movement (where to go) and combat (what to shoot) into one action.
 
 Owner: Wasilah (integration). movement.py = Wasilah, combat.py = teammate.
 """
@@ -34,7 +34,7 @@ def pick_upgrade(offer):
 
 
 class Bot:
-    name = "glitch-v8"
+    name = "glitch-v8b"
 
     def __init__(self, hello):
         cfg = hello["config"]
@@ -50,8 +50,6 @@ class Bot:
         }
         # Load the map once (buildings -> cover spots). If it fails, movement runs without it.
         self.memory["map"] = mapdata.MapData(hello.get("map", {}).get("dir", "/arena"))
-        if not self.memory["map"].ok:
-            self.memory["map"] = mapdata.MapData("/arena")
         mf.log(f"map loaded: {self.memory['map'].ok}, buildings={len(self.memory['map'].prisms)}, "
                f"cover spots={len(self.memory['map'].cover)}")
 
