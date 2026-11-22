@@ -1,4 +1,4 @@
-"""Mech Royale v6 combat: survival, farm targets, and cover-aware firing.
+"""Mech Royale v9 combat: focused targets, line-of-sight-aware selection.
 
 Only returns aim, fire, reload.
 
@@ -70,39 +70,54 @@ def decide_combat(obs, memory):
         if now - when > 6.0:
             del attackers[enemy_id]
 
-    # 1. Enemy mechs always have priority over farming targets.
+    # 1. Focus a viable enemy instead of retargeting every tenth of a second.
+    # The previous implementation sometimes picked the nearest mech BEHIND a
+    # wall, dropped it and ignored a second mech that could actually be hit.
+    # With coordinated enemies that wastes many possible shots.
+    gmap = memory.get("map")
+    can_check_cover = gmap is not None and getattr(gmap, "ok", False)
+    previous = memory.get("combat_focus_id")
     target = None
     kind = None
     best_score = float("inf")
+    special_kind = special.get("kind") if special else None
     for enemy in obs.get("mechs", []):
         if enemy.get("kind") != "mech":
             continue
         distance = _d3(pos, enemy["pos"])
         is_attacker = str(enemy["id"]) in attackers
         hp_ratio = enemy.get("hp", 1400) / max(1, enemy.get("max_hp", 1400))
-        can_finish = hp_ratio < 0.18 and distance < 65
+        can_finish = hp_ratio < 0.22 and distance < 70
         if is_attacker:
             if distance > THREAT_RANGE:
                 continue
         elif (health_ratio < 0.45 and not can_finish) or distance > ENGAGE_RANGE:
             continue
-        score = distance + 50 * hp_ratio - (85 if is_attacker else 0)
-        if can_finish:
-            score -= 30
+
+        blocked = False
+        if can_check_cover:
+            try:
+                blocked = bool(gmap.blocked(pos[:2], enemy["pos"][:2], step=5.0))
+            except (AttributeError, TypeError, ValueError):
+                pass
+        # Mortars can lob over cover; otherwise don't fixate on hidden targets.
+        if blocked and not is_attacker and special_kind != "mortar":
+            continue
+
+        # The aim/finish bonuses prevent target hopping between two similar
+        # enemies; finishing one enemy removes a gun from the opposing squad.
+        score = distance + 75 * hp_ratio
+        score -= 35 if is_attacker else 0
+        score -= 95 if can_finish else 0
+        score -= 48 if str(enemy["id"]) == previous else 0
+        score += 170 if blocked else 0
         if score < best_score:
             target, kind, best_score = enemy, "mech", score
 
-    # Experiment: a non-attacking mech hidden behind a building cannot be
-    # hit by our direct-fire weapons. Allow farming to continue instead of
-    # staring at the blocked enemy. Keep recent attackers as priorities.
-    if target is not None and str(target["id"]) not in attackers:
-        gmap = memory.get("map")
-        if gmap is not None and getattr(gmap, "ok", False):
-            try:
-                if gmap.blocked(pos[:2], target["pos"][:2], step=5.0):
-                    target, kind = None, None
-            except (AttributeError, TypeError, ValueError):
-                pass
+    if target is not None:
+        memory["combat_focus_id"] = str(target["id"])
+    else:
+        memory.pop("combat_focus_id", None)
 
     # 2. Farm the NPC or crate selected by movement.py, if still visible.
     # IDs can be integers or strings; normalize to avoid a mismatch.
