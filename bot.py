@@ -50,6 +50,8 @@ class Bot:
         }
         # Load the map once (buildings -> cover spots). If it fails, movement runs without it.
         self.memory["map"] = mapdata.MapData(hello.get("map", {}).get("dir", "/arena"))
+        if not self.memory["map"].ok:  # teammate's fix: try the standard match path as a backup
+            self.memory["map"] = mapdata.MapData("/arena")
         mf.log(f"map loaded: {self.memory['map'].ok}, buildings={len(self.memory['map'].prisms)}, "
                f"cover spots={len(self.memory['map'].cover)}")
 
